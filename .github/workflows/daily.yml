@@ -89,12 +89,16 @@ jobs:
         env:
           RUN_DATE: ${{ steps.d.outputs.date }}
 
-      # booking 잡이 spaces.jsonl.gz 를 읽어야 한다 (~77MB)
+      # booking 잡이 spaces.jsonl.gz 를 읽어야 한다 (~77MB).
+      # sitemap 도 같이 넘긴다 — 이게 있어야 나중에 load 를 다시 돌릴 수 있다.
       - name: 스냅샷 전달
         uses: actions/upload-artifact@v4
         with:
           name: snapshots-${{ steps.d.outputs.date }}
-          path: data/snapshots/${{ steps.d.outputs.date }}/spaces.jsonl.gz
+          path: |
+            data/snapshots/${{ steps.d.outputs.date }}/spaces.jsonl.gz
+            data/sitemap/${{ steps.d.outputs.date }}/spaces.jsonl
+            data/sitemap/${{ steps.d.outputs.date }}/reviews.jsonl
           retention-days: 3
           compression-level: 0
 
@@ -119,11 +123,12 @@ jobs:
         run: |
           printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
 
+      # 여러 path 를 올리면 공통 상위 디렉토리(data/) 기준 구조가 보존된다
       - name: 스냅샷 수신
         uses: actions/download-artifact@v4
         with:
           name: snapshots-${{ needs.crawl.outputs.run_date }}
-          path: data/snapshots/${{ needs.crawl.outputs.run_date }}
+          path: data
 
       - name: 진행분 복원
         uses: actions/cache/restore@v4
