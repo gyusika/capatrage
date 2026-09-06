@@ -1,0 +1,22 @@
+{
+  "name": "capatrage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Capacity Arbitrage - 과수요 시장 탐지 및 경매 역산 파이프라인",
+  "scripts": {
+    "sitemap": "node src/sitemap.js",
+    "crawl": "node src/crawl.js",
+    "load": "node --env-file=.env src/load.js",
+    "booking": "node src/booking.js",
+    "load:booking": "node --env-file=.env src/load_booking.js",
+    "compute": "node --env-file=.env src/compute_fill.js",
+    "sql": "node --env-file=.env scripts/apply_sql.js",
+    "daily": "npm run sitemap && npm run crawl && npm run load && npm run booking && npm run load:booking && npm run compute && npm run revenue",
+    "web": "npm --prefix web run dev",
+    "revenue": "node --env-file=.env src/compute_revenue.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

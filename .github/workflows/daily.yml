@@ -1,0 +1,180 @@
+# 매일 예약 현황을 관측한다.
+#
+# 왜 매일이어야 하는가: 상품의 절반(10,355개 중 5,324개)이 예약 마감 설정 때문에
+# D+2 부터만 달력에 열린다. 그 업체의 D+0/D+1 예약 현황은 이틀 전에 봐두지 않으면
+# 영원히 관측 불가다. 하루 거르면 그날 마감된 업체들의 근접일이 통째로 빈다.
+#
+# 왜 Vercel/Supabase 가 아닌가: 예약 수집이 서울만 해도 약 3시간이다.
+# Vercel Function 은 최대 800초, Supabase Edge Function 도 마찬가지라 담을 수 없다.
+name: daily
+
+on:
+  schedule:
+    # 04:00 KST = 19:00 UTC (전날). 상대 서버가 한가한 시간대.
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: '관측일 (YYYY-MM-DD). 비우면 실행 시점의 KST 날짜'
+        required: false
+
+# 이전 실행이 아직 돌고 있으면 겹치지 않게 한다. 상대 서버에 대한 요청률이
+# 두 배가 되는 것을 막는 안전장치다.
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ── 1단계: 공간 상세 전수 (~80분) ────────────────────────────────
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    outputs:
+      run_date: ${{ steps.d.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 관측일 확정
+        id: d
+        run: |
+          D="${{ inputs.run_date }}"
+          [ -n "$D" ] || D=$(TZ=Asia/Seoul date +%F)
+          echo "date=$D" >> "$GITHUB_OUTPUT"
+          echo "관측일 $D"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      # 스크립트들이 `node --env-file=.env` 로 켜져 있어서 파일로 떨군다.
+      - name: .env 생성
+        run: |
+          printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
+
+      # 실패 후 재실행할 때 done.txt 로 이어받는다
+      - name: 진행분 복원
+        uses: actions/cache/restore@v4
+        with:
+          path: data/snapshots/${{ steps.d.outputs.date }}
+          key: snapshots-${{ steps.d.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: snapshots-${{ steps.d.outputs.date }}-
+
+      - name: sitemap 열거
+        run: npm run sitemap
+        env:
+          RUN_DATE: ${{ steps.d.outputs.date }}
+
+      - name: 상세 전수 크롤
+        run: npm run crawl
+        env:
+          RUN_DATE: ${{ steps.d.outputs.date }}
+          CRAWL_RPS: '3'
+          CRAWL_CONCURRENCY: '4'
+
+      - name: 진행분 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/snapshots/${{ steps.d.outputs.date }}
+          key: snapshots-${{ steps.d.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 공간·상품·태그 적재
+        run: npm run load
+        env:
+          RUN_DATE: ${{ steps.d.outputs.date }}
+
+      # booking 잡이 spaces.jsonl.gz 를 읽어야 한다 (~77MB)
+      - name: 스냅샷 전달
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshots-${{ steps.d.outputs.date }}
+          path: data/snapshots/${{ steps.d.outputs.date }}/spaces.jsonl.gz
+          retention-days: 3
+          compression-level: 0
+
+  # ── 2단계: 예약 현황 관측 (~3시간, 서울) ─────────────────────────
+  booking:
+    needs: crawl
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      RUN_DATE: ${{ needs.crawl.outputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: .env 생성
+        run: |
+          printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
+
+      - name: 스냅샷 수신
+        uses: actions/download-artifact@v4
+        with:
+          name: snapshots-${{ needs.crawl.outputs.run_date }}
+          path: data/snapshots/${{ needs.crawl.outputs.run_date }}
+
+      - name: 진행분 복원
+        uses: actions/cache/restore@v4
+        with:
+          path: data/booking/${{ needs.crawl.outputs.run_date }}
+          key: booking-${{ needs.crawl.outputs.run_date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: booking-${{ needs.crawl.outputs.run_date }}-
+
+      # TARGET_SIDO=11 (서울). booking.js 의 기본값이라 명시만 해둔다.
+      - name: 예약 현황 수집
+        run: npm run booking
+        env:
+          TARGET_SIDO: '11'
+          BOOK_RPS: '2'
+          BOOK_CONCURRENCY: '3'
+
+      - name: 진행분 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/booking/${{ needs.crawl.outputs.run_date }}
+          key: booking-${{ needs.crawl.outputs.run_date }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 예약 적재
+        run: npm run load:booking
+
+      - name: 영업시간 판정 + 예약률
+        run: npm run compute
+
+      - name: 매출 집계
+        run: npm run revenue
+
+      - name: 수집 결과 요약
+        if: always()
+        run: |
+          {
+            echo "## 관측일 ${RUN_DATE}"
+            echo
+            gunzip -c "data/booking/${RUN_DATE}/slots.jsonl.gz" 2>/dev/null \
+              | wc -l | xargs printf '- 일자레코드 %s건\n' || true
+            wc -l < "data/booking/${RUN_DATE}/done.txt" 2>/dev/null \
+              | xargs printf '- 완료 요청 %s건\n' || true
+            wc -l < "data/booking/${RUN_DATE}/errors.log" 2>/dev/null \
+              | xargs printf '- 실패 %s건\n' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 실패 로그 보존
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: booking-errors-${{ needs.crawl.outputs.run_date }}
+          path: data/booking/${{ needs.crawl.outputs.run_date }}/errors.log
+          retention-days: 14
+          if-no-files-found: ignore

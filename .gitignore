@@ -1,0 +1,19 @@
+node_modules/
+data/
+*.log
+
+# 시크릿. public 저장소라 .env 계열은 전부 막고 예시만 남긴다.
+.env
+.env.*
+!.env.example
+
+# Next.js
+.next/
+*.tsbuildinfo
+
+# 시장 분석 결과물. 수집 워크플로와 무관하고 공개할 이유가 없다.
+report/
+
+# web/ 은 자체 git 저장소이고 .env.local 에 실 자격증명이 있다.
+# public 저장소로 끌어들이지 않는다. 수집 워크플로와도 무관하다.
+web/
