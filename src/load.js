@@ -54,6 +54,7 @@ console.log(`review: ${nRv}건 처리`);
 const spaceRows = [];
 const snapRows = [];
 const prodRows = [];
+const rsvRows = [];
 const tagRows = [];
 let ok = 0,
   gone = 0;
@@ -146,7 +147,18 @@ for await (const line of rl) {
       id, pi.id, date, pi.name ?? null, pi.price ?? null, pi.RSV_TP_CD ?? null,
       pi.charging_per_person ?? null, pi.min_time_policy ?? null, pi.max_guest_capacity ?? null,
       Number(pi.area_size_pyeong) || null, Number(pi.area_size_square_meter) || null,
+      pi.min_guest_policy ?? null,
     ]);
+    // 인원 요금은 상품이 아니라 예약타입에 붙는다. 매출 상한을 여기서 계산한다.
+    for (const rt of p.reservation_types ?? []) {
+      if (!rt?.id) continue;
+      rsvRows.push([
+        id, pi.id, rt.id, date, rt.RSV_TP_CD ?? null, rt.price ?? null,
+        rt.charging_per_person ?? pi.charging_per_person ?? null,
+        rt.person_ceiling ?? null, rt.extra_person_price ?? null,
+        rt.is_extra_person_price_per_hour ?? null,
+      ]);
+    }
   }
   for (const t of d.tags ?? []) tagRows.push([id, t.tag, t.rank ?? null]);
 }
@@ -194,9 +206,18 @@ console.log(`space_snapshot: ${snapRows.length}건`);
 
 await insertBatch(client, 'product_snapshot',
   ['space_id','product_id','snapshot_date','name','price','rsv_tp_cd','charging_per_person',
-   'min_time_policy','max_guest_capacity','area_pyeong','area_sqm'],
-  prodRows, 'on conflict (space_id, product_id, snapshot_date) do nothing');
+   'min_time_policy','max_guest_capacity','area_pyeong','area_sqm','min_guest_policy'],
+  prodRows,
+  // 나중에 추가한 컬럼은 do nothing 이면 기존 행에 영원히 안 채워진다
+  `on conflict (space_id, product_id, snapshot_date) do update
+     set min_guest_policy = excluded.min_guest_policy`);
 console.log(`product_snapshot: ${prodRows.length}건`);
+
+await insertBatch(client, 'rsv_type_snapshot',
+  ['space_id','product_id','rsv_type_id','snapshot_date','rsv_tp_cd','price',
+   'charging_per_person','person_ceiling','extra_person_price','extra_per_hour'],
+  rsvRows, 'on conflict (space_id, product_id, rsv_type_id, snapshot_date) do nothing');
+console.log(`rsv_type_snapshot: ${rsvRows.length}건`);
 
 await insertBatch(client, 'space_tag', ['space_id','tag','rank'], tagRows,
   'on conflict (space_id, tag) do nothing');
