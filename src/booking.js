@@ -62,10 +62,13 @@ const spaceMeta = new Map();
       const pid = p.info?.id;
       if (!pid) continue;
       for (const rt of p.reservation_types ?? []) {
-        // 예약률은 시간 단위 상품에서만 의미가 있다. DAY/PACKAGE 는 스케일이 다르다.
-        if (rt.RSV_TP_CD !== 'TIME') continue;
+        // 예약률은 시간 단위 상품에서만 의미가 있다. DAY/MONTH 는 스케일이 다르다.
+        // PKG 는 예약률에는 안 쓰지만 가격표로 쓴다 — 같은 시간을 시간제보다 싸게
+        // 파는 창이라 매출 하한이 여기서 나온다. 응답 구조가 달라 kind 로 가른다.
+        if (rt.RSV_TP_CD !== 'TIME' && rt.RSV_TP_CD !== 'PKG') continue;
         jobs.push({
           space_id: r.id, product_id: pid, rsv_type_id: rt.id,
+          kind: rt.RSV_TP_CD === 'PKG' ? 'pkg' : 'time',
           product_name: p.info?.name ?? null,
           pyeong: Number(p.info?.area_size_pyeong) || null,
           max_guest: p.info?.max_guest_capacity ?? null,
@@ -100,7 +103,8 @@ units = units.filter((u) => !done.has(key(u)));
 
 console.log(
   `대상 ${TARGETS ? TARGETS.join(',') : '시도코드 ' + TARGET_SIDO} | ` +
-  `공간 ${spaceMeta.size}곳 | 시간제 상품 ${jobs.length}개`
+  `공간 ${spaceMeta.size}곳 | 시간제 ${jobs.filter((j) => j.kind === 'time').length}개 ` +
+  `+ 패키지 ${jobs.filter((j) => j.kind === 'pkg').length}개`
 );
 console.log(`요청 ${units.length}건 (완료 ${done.size}) | ${RPS} req/s, 동시 ${CONC}`);
 
@@ -115,7 +119,7 @@ gz.pipe(fs.createWriteStream(path.join(outDir, 'slots.jsonl.gz'), { flags: 'a' }
 const doneOut = fs.createWriteStream(donePath, { flags: 'a' });
 
 const gate = rateLimiter(RPS);
-let cursor = 0, ok = 0, fail = 0, slotDays = 0, sinceFlush = 0;
+let cursor = 0, ok = 0, fail = 0, slotDays = 0, pkgDays = 0, sinceFlush = 0;
 const started = Date.now();
 
 const writeGz = async (line) => {
@@ -152,25 +156,48 @@ async function worker() {
       `?reservation_type_id=${u.rsv_type_id}&year=${u.year}&month=${u.month}`;
     try {
       const d = await fetchJson(url);
-      for (const day of d.days ?? []) {
-        if (!day.times?.length) continue; // 과거 날짜는 times 가 없다
-        const booked = day.times.filter((t) => !t.available).map((t) => t.hour);
-        // 표본 12개 중 5개가 시간대별로 가격이 달랐다(최대 5배). 하루 가격 하나로는 매출이 틀어진다.
-        const hp = Array.from({ length: 24 }, (_, h) => {
-          const t = day.times.find((x) => x.hour === h);
-          return t?.price ?? null;
-        });
-        await writeGz(
-          JSON.stringify({
-            space_id: u.space_id, product_id: u.product_id, rsv_type_id: u.rsv_type_id,
-            observed: date,
-            d: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
-            wday: day.wday, hday: day.hday,
-            n_slots: day.times.length, booked, hp,
-            price: day.times[0]?.price ?? null,
-          }) + '\n'
-        );
-        slotDays++;
+      if (u.kind === 'pkg') {
+        // PKG 응답은 times 대신 day.packages[] 를 준다.
+        // {id, name, shour, ehour, price, available}. 시작·끝 시각과 가격이 실측으로 나온다.
+        for (const day of d.days ?? []) {
+          if (!day.packages?.length) continue; // 과거 날짜는 packages 가 없다
+          const dd = `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`;
+          for (const p of day.packages) {
+            await writeGz(
+              JSON.stringify({
+                kind: 'pkg',
+                space_id: u.space_id, product_id: u.product_id, rsv_type_id: u.rsv_type_id,
+                observed: date, d: dd, package_id: p.id, name: p.name ?? null,
+                shour: p.shour, ehour: p.ehour, price: p.price ?? null,
+                // 그 구간이 통째로 비어 있는가. 1시간만 시간제로 팔려도 false 가 되므로
+                // 판매 신호로는 쓸 수 없다. 가격표를 언제 걸어두는지의 근거로만 쓴다.
+                available: !!p.available,
+              }) + '\n'
+            );
+            pkgDays++;
+          }
+        }
+      } else {
+        for (const day of d.days ?? []) {
+          if (!day.times?.length) continue; // 과거 날짜는 times 가 없다
+          const booked = day.times.filter((t) => !t.available).map((t) => t.hour);
+          // 표본 12개 중 5개가 시간대별로 가격이 달랐다(최대 5배). 하루 가격 하나로는 매출이 틀어진다.
+          const hp = Array.from({ length: 24 }, (_, h) => {
+            const t = day.times.find((x) => x.hour === h);
+            return t?.price ?? null;
+          });
+          await writeGz(
+            JSON.stringify({
+              space_id: u.space_id, product_id: u.product_id, rsv_type_id: u.rsv_type_id,
+              observed: date,
+              d: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
+              wday: day.wday, hday: day.hday,
+              n_slots: day.times.length, booked, hp,
+              price: day.times[0]?.price ?? null,
+            }) + '\n'
+          );
+          slotDays++;
+        }
       }
       doneOut.write(key(u) + '\n');
       ok++;
@@ -182,7 +209,7 @@ async function worker() {
     if (n % 200 === 0) {
       const el = (Date.now() - started) / 1000;
       console.log(
-        `[${n}/${units.length}] ok=${ok} fail=${fail} 일자레코드=${slotDays} ` +
+        `[${n}/${units.length}] ok=${ok} fail=${fail} 일자레코드=${slotDays} 패키지=${pkgDays} ` +
           `${(n / el).toFixed(1)}/s ETA ${Math.round((units.length - n) / (n / el) / 60)}분`
       );
     }
@@ -192,4 +219,4 @@ async function worker() {
 await Promise.all(Array.from({ length: CONC }, worker));
 await new Promise((r) => gz.end(r));
 doneOut.end();
-console.log(`완료: ok=${ok} fail=${fail} 일자레코드=${slotDays} -> ${outDir}/slots.jsonl.gz`);
+console.log(`완료: ok=${ok} fail=${fail} 일자레코드=${slotDays} 패키지레코드=${pkgDays} -> ${outDir}/slots.jsonl.gz`);

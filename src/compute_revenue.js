@@ -28,7 +28,8 @@ const r = await c.query(
      (space_id, observed_date, short_days, short_open_h, short_booked_h, short_fill,
       short_rev_day, rev_month_short, all_days, all_booked_h, all_fill, rev_month_all,
       rev_month_max, adr, dummy_h, dummy_rev,
-      rev_month_short_ceil, rev_month_all_ceil, n_rsv_blocks)
+      rev_month_short_ceil, rev_month_all_ceil, n_rsv_blocks,
+      n_pkg_blocks, pkg_cut_short, pkg_cut_all)
    with ex as (
      select b.space_id, b.product_id, b.rsv_type_id, b.observed_date, b.target_date,
             (b.target_date - b.observed_date) as lead_days,
@@ -112,6 +113,58 @@ const r = await c.query(
                          or not coalesce(m.prev_sold, false))) as block_start
        from marked m
    ),
+   -- 덩어리마다 번호를 매겨 [시작시각, 끝시각] 을 뽑는다. 패키지 창과 맞출 단위다.
+   -- 예약된 시각만 남기고 나서 번호를 매긴다. block_start 는 예약된 행에서만 참이라
+   -- 안 팔린 행은 누적합에 0을 더할 뿐이고, 먼저 걸러도 번호가 같다.
+   -- 1,320만 행 위에서 윈도우를 돌리면 40분이 넘는다. 걸러내면 220만 행이다.
+   numbered as (
+     select b.space_id, b.product_id, b.rsv_type_id, b.observed_date, b.target_date,
+            b.lead_days, b.hour, b.floor_amt,
+            sum(case when b.block_start then 1 else 0 end) over (
+              partition by b.space_id, b.product_id, b.rsv_type_id, b.target_date
+              order by b.hour rows unbounded preceding) as blk
+       from blocked b
+      where b.sold
+   ),
+   blk_agg as (
+     select space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk,
+            min(hour) as h0, max(hour) as h1, sum(floor_amt) as blk_floor
+       from numbered
+      group by space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk
+   ),
+   -- 패키지 가격표. 같은 구간을 시간제 합계보다 싸게 파는 창이다.
+   -- 자정을 넘는 창(shour >= ehour)은 하루 단위 덩어리와 맞출 수 없어 뺀다.
+   -- 1인당 과금 패키지면 기본가가 1인 단가라 최소 인원을 곱해야 하한이 된다.
+   pkg as (
+     select p.space_id, p.product_id, p.target_date, p.shour, p.ehour,
+            min(case when coalesce(g.per_person, false) then p.price * g.min_guest
+                     else p.price end) as pkg_floor
+       from booking_package p
+       left join guest g on g.space_id = p.space_id and g.product_id = p.product_id
+                        and g.rsv_type_id = p.rsv_type_id
+      where p.observed_date = $1 and p.shour < p.ehour and p.price > 0
+      group by p.space_id, p.product_id, p.target_date, p.shour, p.ehour
+   ),
+   -- 예약 덩어리가 패키지 창과 정확히 일치하면 그 덩어리는 패키지로 팔렸을 수 있다.
+   -- 어느 쪽으로 팔렸는지는 관측되지 않으므로 하한에는 싼 값(패키지가)을 쓴다.
+   -- 상한(ceil_amt 합계)은 시간제로 팔린 경우라 그대로 둔다.
+   -- 일치하지 않는 덩어리는 패키지로 살 수 없는 구간이라 손대지 않는다.
+   pkg_adj as (
+     select a.space_id, a.observed_date, a.lead_days,
+            a.blk_floor - k.pkg_floor as cut
+       from blk_agg a
+       join pkg k on k.space_id = a.space_id and k.product_id = a.product_id
+                 and k.target_date = a.target_date
+                 and k.shour = a.h0 and k.ehour = a.h1 + 1
+      where k.pkg_floor < a.blk_floor
+   ),
+   adj as (
+     select space_id, observed_date,
+            coalesce(sum(cut) filter (where lead_days <= $2), 0) as cut_short,
+            coalesce(sum(cut), 0)                                as cut_all,
+            count(*)::int                                        as n_pkg_blocks
+       from pkg_adj group by space_id, observed_date
+   ),
    agg as (
      select space_id, observed_date,
        count(distinct target_date) filter (where lead_days <= $2 and not coalesce(dummy, false)) as short_days,
@@ -133,21 +186,27 @@ const r = await c.query(
        count(*) filter (where block_start)                                                       as n_blocks
        from blocked group by space_id, observed_date
    )
-   select space_id, observed_date,
-     short_days::int, short_open_h::int, short_booked_h::int,
-     round(short_booked_h::numeric / nullif(short_open_h, 0), 4),
-     round(short_rev::numeric / nullif(short_days, 0), 1),
-     round(short_rev::numeric / nullif(short_days, 0) * $3, 0),
-     all_days::int, all_booked_h::int,
-     round(all_booked_h::numeric / nullif(all_open_h, 0), 4),
-     round(all_rev::numeric / nullif(all_days, 0) * $3, 0),
-     round(max_rev::numeric / nullif(all_days, 0) * $3, 0),
-     round(adr::numeric, 1),
-     dummy_h::int, round(dummy_rev::numeric, 0),
-     round(short_rev_ceil::numeric / nullif(short_days, 0) * $3, 0),
-     round(all_rev_ceil::numeric / nullif(all_days, 0) * $3, 0),
-     n_blocks::int
-   from agg`,
+   select a.space_id, a.observed_date,
+     a.short_days::int, a.short_open_h::int, a.short_booked_h::int,
+     round(a.short_booked_h::numeric / nullif(a.short_open_h, 0), 4),
+     -- 하한에서 패키지 보정분을 뺀다. 상한은 그대로다.
+     round((a.short_rev - coalesce(j.cut_short, 0))::numeric / nullif(a.short_days, 0), 1),
+     round((a.short_rev - coalesce(j.cut_short, 0))::numeric / nullif(a.short_days, 0) * $3, 0),
+     a.all_days::int, a.all_booked_h::int,
+     round(a.all_booked_h::numeric / nullif(a.all_open_h, 0), 4),
+     round((a.all_rev - coalesce(j.cut_all, 0))::numeric / nullif(a.all_days, 0) * $3, 0),
+     round(a.max_rev::numeric / nullif(a.all_days, 0) * $3, 0),
+     -- adr 은 예약된 시간의 시간제 게시 단가 평균이다. 패키지 보정을 넣지 않는다.
+     round(a.adr::numeric, 1),
+     a.dummy_h::int, round(a.dummy_rev::numeric, 0),
+     round(a.short_rev_ceil::numeric / nullif(a.short_days, 0) * $3, 0),
+     round(a.all_rev_ceil::numeric / nullif(a.all_days, 0) * $3, 0),
+     a.n_blocks::int,
+     coalesce(j.n_pkg_blocks, 0),
+     round(coalesce(j.cut_short, 0)::numeric / nullif(a.short_days, 0) * $3, 0),
+     round(coalesce(j.cut_all, 0)::numeric / nullif(a.all_days, 0) * $3, 0)
+   from agg a
+   left join adj j on j.space_id = a.space_id and j.observed_date = a.observed_date`,
   [date, SHORT_DAYS, DAYS_PER_MONTH, DUMMY_MULT]
 );
 console.log(`space_revenue: ${r.rowCount}곳`);
@@ -186,6 +245,32 @@ console.log(
   `\n공간 ${x.n}곳 (D+1~${SHORT_DAYS} 예약 있는 곳 ${x.active}곳)\n` +
   `월 매출 추산 중앙값 ${won(x.med)} · 상위10% ${won(x.p90)}\n` +
   `100% 찼을 때 잠재 매출 중앙값 ${won(x.max_med)} · 예약 시간 평균 단가 ${won(x.adr)}`
+);
+
+// 패키지 보정. 같은 시간을 시간제보다 싸게 파는 창이 있으면 하한이 그쪽으로 내려간다.
+const pk = await c.query(
+  `select count(*) filter (where n_pkg_blocks > 0)::int spaces,
+          coalesce(sum(n_pkg_blocks), 0)::int blocks,
+          coalesce(sum(pkg_cut_all), 0)::bigint cut,
+          round(percentile_cont(0.5) within group (
+            order by case when n_pkg_blocks > 0 and rev_month_all > 0
+                          then pkg_cut_all::numeric / (rev_month_all + pkg_cut_all) end)::numeric, 3) share
+     from space_revenue where observed_date = $1`, [date]);
+const pkx = pk.rows[0];
+const pkgAll = await c.query(
+  `select count(*)::int rows, count(distinct space_id)::int spaces,
+          count(*) filter (where shour >= ehour)::int wrap
+     from booking_package where observed_date = $1`, [date]);
+const pax = pkgAll.rows[0];
+console.log(
+  `\n패키지 가격표 ${Number(pax.rows).toLocaleString('ko-KR')}행 / ${pax.spaces}곳` +
+  (pax.wrap ? ` (자정을 넘는 창 ${pax.wrap}행은 제외)` : '') + '\n' +
+  (pkx.blocks
+    ? `  예약 덩어리 ${Number(pkx.blocks).toLocaleString('ko-KR')}건이 패키지 창과 정확히 일치해 ` +
+      `${pkx.spaces}곳의 하한을 패키지가로 다시 잡았다\n` +
+      `  그만큼 깎인 월환산 매출 ${won(pkx.cut)} · 해당 공간 하한의 중앙값 기준 ` +
+      `${pkx.share == null ? '—' : (Number(pkx.share) * 100).toFixed(1) + '%'} 감소`
+    : '  패키지 창과 정확히 일치하는 예약 덩어리가 없어 하한 보정 없음')
 );
 
 // 매출 구간. 예약 인원을 관측할 수 없어 값 하나로 낼 수 없다.

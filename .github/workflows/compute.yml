@@ -1,0 +1,79 @@
+# 집계만 다시 돌린다. 수집은 건드리지 않는다.
+#
+# 왜 따로 있는가: 집계는 DB 만 읽고 쓴다. 수집 결과가 이미 booking_day 에 들어가 있으면
+# 언제든 다시 계산할 수 있다. daily 의 compute 잡은 crawl·booking 을 needs 로 달고 있어
+# 단독 실행이 안 되므로, 재실행 전용 입구를 하나 둔다.
+#
+# 쓰는 때:
+#   - daily 의 집계 단계가 실패했을 때 (수집분은 남아 있으므로 이것만 다시 돌리면 된다)
+#   - 집계 로직을 고치고 과거 관측일에 소급 적용할 때
+#
+# 로컬에서 돌리면 안 되는 이유: 매출 집계 쿼리가 수 분에서 수십 분 걸린다.
+# 그 사이 노트북 네트워크가 한 번만 끊겨도 트랜잭션이 통째로 롤백되고 처음부터다.
+name: compute
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: '관측일 (YYYY-MM-DD). booking_day 에 그 날짜가 있어야 한다'
+        required: true
+      skip_fill:
+        description: '영업시간 판정을 건너뛰고 매출만 다시 낸다'
+        type: boolean
+        default: false
+
+concurrency:
+  group: compute-${{ inputs.run_date }}
+  cancel-in-progress: false
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RUN_DATE: ${{ inputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: .env 생성
+        run: |
+          printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
+
+      - name: 영업시간 판정 + 예약률
+        if: ${{ !inputs.skip_fill }}
+        run: npm run compute
+
+      - name: 매출 집계
+        run: npm run revenue
+
+      - name: 결과 요약
+        if: always()
+        run: |
+          {
+            echo "## 집계 ${RUN_DATE}"
+            echo
+            echo '```'
+            node --env-file=.env -e "
+              const pg = require('pg');
+              (async () => {
+                const c = new pg.Client({ connectionString: process.env.DATABASE_URL,
+                                          ssl: { rejectUnauthorized: false } });
+                await c.connect();
+                for (const t of ['booking_hour_class','booking_space_fill','space_revenue']) {
+                  const r = await c.query(
+                    \`select count(*) n from \${t} where observed_date = \$1\`, [process.env.RUN_DATE]);
+                  console.log(t.padEnd(20), r.rows[0].n + '건');
+                }
+                await c.end();
+              })();
+            " || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

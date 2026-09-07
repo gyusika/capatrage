@@ -43,11 +43,19 @@ const rl = readline.createInterface({
 // 같은 (공간,상품,타입,관측일,대상일)이 두 달치 응답에 겹쳐 들어올 수 있다.
 // 두 번째 것을 버리지 않고 마지막 값으로 덮되, 배치 안에서 키 충돌이 나지 않게 먼저 합친다.
 const seen = new Map();
+// 패키지는 같은 파일에 kind:'pkg' 로 섞여 들어온다. 한 행 = (상품, PKG타입, 패키지, 대상일).
+const seenPkg = new Map();
 for await (const line of rl) {
   if (!line.trim()) continue;
   let r;
   try { r = JSON.parse(line); } catch { continue; }
   if (r.d < r.observed) { skippedPast++; continue; }
+  if (r.kind === 'pkg') {
+    seenPkg.set(
+      `${r.space_id}|${r.product_id}|${r.rsv_type_id}|${r.package_id}|${r.observed}|${r.d}`, r
+    );
+    continue;
+  }
   const k = `${r.space_id}|${r.product_id}|${r.rsv_type_id}|${r.observed}|${r.d}`;
   seen.set(k, r);
 }
@@ -75,6 +83,32 @@ const n = await insertBatch(
   400
 );
 console.log(`booking_day: ${n}건 적재 (과거일 제외 ${skippedPast}건)`);
+
+// ── 패키지 가격표 ────────────────────────────────────────────────
+// 같은 시간을 시간제보다 싸게 파는 창이다. 매출 하한이 여기서 나온다.
+const pkgRows = [];
+for (const r of seenPkg.values())
+  pkgRows.push([
+    r.space_id, r.product_id, r.rsv_type_id, r.package_id, r.observed, r.d,
+    r.name ?? null, r.shour, r.ehour, r.price ?? null, r.available === true,
+  ]);
+
+if (pkgRows.length) {
+  const np = await insertBatch(
+    client, 'booking_package',
+    ['space_id','product_id','rsv_type_id','package_id','observed_date','target_date',
+     'name','shour','ehour','price','available'],
+    pkgRows,
+    `on conflict (space_id, product_id, rsv_type_id, package_id, observed_date, target_date)
+     do update set name=excluded.name, shour=excluded.shour, ehour=excluded.ehour,
+       price=excluded.price, available=excluded.available`,
+    400
+  );
+  const wrap = pkgRows.filter((r) => r[7] >= r[8]).length;
+  console.log(`booking_package: ${np}건 적재 (자정을 넘는 창 ${wrap}건 — 매출 보정에서는 제외된다)`);
+} else {
+  console.log('booking_package: 0건 (이번 수집분에 패키지가 없다)');
+}
 
 const s = await client.query(
   `select count(distinct space_id) spaces, count(*) rows,

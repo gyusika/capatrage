@@ -102,11 +102,13 @@ jobs:
           retention-days: 3
           compression-level: 0
 
-  # ── 2단계: 예약 현황 관측 (~3시간, 서울) ─────────────────────────
+  # ── 2단계: 예약 현황 관측 (~4시간, 서울) ─────────────────────────
+  # 시간제 10,373개 + 패키지 4,961개 예약타입 × 월 2회 = 약 3만 요청.
+  # GitHub 호스티드 러너의 상한이 6시간이라 그 바로 아래로 잡는다.
   booking:
     needs: crawl
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 350
     env:
       RUN_DATE: ${{ needs.crawl.outputs.run_date }}
     steps:
@@ -155,12 +157,6 @@ jobs:
       - name: 예약 적재
         run: npm run load:booking
 
-      - name: 영업시간 판정 + 예약률
-        run: npm run compute
-
-      - name: 매출 집계
-        run: npm run revenue
-
       - name: 수집 결과 요약
         if: always()
         run: |
@@ -183,3 +179,34 @@ jobs:
           path: data/booking/${{ needs.crawl.outputs.run_date }}/errors.log
           retention-days: 14
           if-no-files-found: ignore
+
+  # ── 3단계: 집계 (~40분) ──────────────────────────────────────────
+  # 수집 잡에서 떼어냈다. 이 단계는 DB 만 읽고 쓰므로 스냅샷이 필요 없고,
+  # 수집이 4시간을 쓰고 나면 같은 잡 안에서는 6시간 상한에 걸린다.
+  # 실제로 09-06·09-07 관측분이 여기서 죽어서 파생 테이블이 열흘 넘게 08-26 에 멈춰 있었다.
+  # 잡을 나누면 집계가 실패해도 수집분은 남고, 이 잡만 재실행하면 된다.
+  compute:
+    needs: [crawl, booking]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RUN_DATE: ${{ needs.crawl.outputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: .env 생성
+        run: |
+          printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
+
+      - name: 영업시간 판정 + 예약률
+        run: npm run compute
+
+      - name: 매출 집계
+        run: npm run revenue

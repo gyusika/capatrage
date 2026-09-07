@@ -8,6 +8,9 @@ const MIN_DAYS = Number(process.env.CLOSED_MIN_DAYS ?? 14);
 
 const db = pool();
 const c = await db.connect();
+// 관측일이 늘면서 09-06 관측분(55만행)부터 차단 판별 UPDATE 가 서버 기본 2분을 넘겨
+// 트랜잭션째로 롤백됐다. 배치 잡이므로 푼다. compute_revenue 와 같은 처리다.
+await c.query(`set statement_timeout = 0`);
 
 console.log(`관측일 ${date} | 영업시간 판정 최소 관측일수 ${MIN_DAYS}일`);
 
@@ -77,18 +80,27 @@ console.log(`booking_space_fill: ${r2.rowCount}건`);
 // ── 2b. 캘린더 차단 판별 ─────────────────────────────────────────
 // 실제 예약은 날짜마다 시각 조합이 다르다. 차단은 매일 똑같다.
 // mode_share >= 0.8 이면 차단 의심. 지우지 않고 표시만 하되 집계에서는 뺀다.
+// 24시간을 cross join 해서 13.2M 행을 만들지 않는다. 예약된 시각은 이미 배열이라
+// 그것만 펼치면 2.2M 행이면 된다. 휴무 시각은 상품별로 배열 하나로 접어놓고 뺀다.
+// 08-26 관측분에서 두 방식의 결과가 2,685곳 전부 일치하는 것을 확인했다 (63.9초 -> 2.2초).
+// 관측일이 55만 행으로 늘자 예전 방식이 40분을 넘겨 파이프라인을 세웠다.
 const r2b = await c.query(
-  `with pat as (
+  `with cls as (
+     select space_id, product_id, rsv_type_id,
+            coalesce(array_agg(hour) filter (where is_closed), '{}') as closed_h
+       from booking_hour_class
+      where observed_date = $1
+      group by 1, 2, 3
+   ),
+   pat as (
      select b.space_id, b.product_id, b.target_date,
-            array_agg(h.hour order by h.hour)
-              filter (where h.hour = any(b.booked_hours) and not k.is_closed) as hrs
+            array_agg(x order by x) as hrs
        from booking_day b
-       cross join generate_series(0, 23) as h(hour)
-       join booking_hour_class k
-         on k.space_id = b.space_id and k.product_id = b.product_id
-        and k.rsv_type_id = b.rsv_type_id and k.observed_date = b.observed_date
-        and k.hour = h.hour
+       left join cls c on c.space_id = b.space_id and c.product_id = b.product_id
+                      and c.rsv_type_id = b.rsv_type_id
+       cross join lateral unnest(b.booked_hours) as x
       where b.observed_date = $1 and b.target_date > b.observed_date
+        and not (x = any(coalesce(c.closed_h, '{}'::smallint[])))
       group by 1, 2, 3
    ),
    cnt as (
