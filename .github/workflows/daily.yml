@@ -210,3 +210,8 @@ jobs:
 
       - name: 매출 집계
         run: npm run revenue
+
+      # 지나간 날짜를 실제로 세서 낸 매출. 곱셈이 없다.
+      # 관측이 쌓일수록 실측 일수가 늘고, 30일이 차면 진짜 월매출이 된다.
+      - name: 실측 매출
+        run: npm run settled

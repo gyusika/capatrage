@@ -12,9 +12,10 @@
     "load:booking": "node --env-file=.env src/load_booking.js",
     "compute": "node --env-file=.env src/compute_fill.js",
     "sql": "node --env-file=.env scripts/apply_sql.js",
-    "daily": "npm run sitemap && npm run crawl && npm run load && npm run booking && npm run load:booking && npm run compute && npm run revenue",
+    "daily": "npm run sitemap && npm run crawl && npm run load && npm run booking && npm run load:booking && npm run compute && npm run revenue && npm run settled",
     "web": "npm --prefix web run dev",
-    "revenue": "node --env-file=.env src/compute_revenue.js"
+    "revenue": "node --env-file=.env src/compute_revenue.js",
+    "settled": "node --env-file=.env src/compute_settled.js"
   },
   "dependencies": {
     "pg": "^8.13.1"
