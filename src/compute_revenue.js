@@ -15,12 +15,19 @@ const DAYS_PER_MONTH = 30.4;
 // 더미 가격 경계. 그 상품 통상 단가의 몇 배부터 "팔 생각이 없는 값"으로 볼지.
 // 배수 분포가 이봉이고 10~20배 구간이 골짜기다. 근거는 sql/008_dummy_price.sql 참고.
 const DUMMY_MULT = Number(process.env.DUMMY_PRICE_MULT ?? 10);
+/**
+ * 더미 가격 절대 상한. 상대 규칙(통상 단가의 N배)만으로는 단가가 한 값뿐이거나
+ * 단계가 촘촘한 상품에서 차단값을 못 잡는다. 예약된 시각 단가의 p99 가 400,000원이라
+ * 50만원은 정상 단가 위쪽 바깥이다.
+ */
+const DUMMY_ABS = Number(process.env.DUMMY_PRICE_ABS ?? 500000);
+
 
 const db = pool();
 const c = await db.connect();
 await prepBatch(c, { name: `capatrage-revenue-${date}` });
 
-console.log(`관측일 ${date} | 단기 기준 D+1~D+${SHORT_DAYS} | 더미 가격 경계 통상단가의 ${DUMMY_MULT}배`);
+console.log(`관측일 ${date} | 단기 기준 D+1~D+${SHORT_DAYS} | 더미 가격 경계 통상단가의 ${DUMMY_MULT}배 또는 시간당 ${DUMMY_ABS.toLocaleString('ko-KR')}원 이상`);
 
 // 한 방 쿼리라 중간 진행이 없다. 도는 중이라는 것만 알리고 끝나면 결과를 남긴다.
 const P = stage('revenue', date, { total: 1, note: '매출 환산 (수백만 행 집계, 수십 분)' });
@@ -56,7 +63,7 @@ const r = await c.query(
       where b.observed_date = $1 and b.target_date > b.observed_date
         and not k.is_closed          -- 영업시간만 센다
    ),
-${pricingCTEs('$1', '$4')}
+${pricingCTEs('$1', '$4', '$5')}
    adj as (
      select space_id, observed_date,
             coalesce(sum(cut) filter (where lead_days <= $2), 0) as cut_short,
@@ -134,7 +141,7 @@ ${pricingCTEs('$1', '$4')}
      round(coalesce(j.cut_all, 0)::numeric / nullif(a.all_days, 0) * $3, 0)
    from agg a
    left join adj j on j.space_id = a.space_id and j.observed_date = a.observed_date`,
-  [date, SHORT_DAYS, DAYS_PER_MONTH, DUMMY_MULT]
+  [date, SHORT_DAYS, DAYS_PER_MONTH, DUMMY_MULT, DUMMY_ABS]
 );
 if (EXPLAIN) {
   console.log(r.rows.map((x) => x['QUERY PLAN']).join('\n'));

@@ -16,6 +16,13 @@ const date = process.env.LOAD_DATE ?? today();
 /** 관측이 이 날짜보다 며칠 이내면 사실상 최종으로 본다. */
 const FINAL_LEAD = Number(process.env.SETTLED_FINAL_LEAD ?? 1);
 const DUMMY_MULT = Number(process.env.DUMMY_PRICE_MULT ?? 10);
+/**
+ * 더미 가격 절대 상한. 상대 규칙(통상 단가의 N배)만으로는 단가가 한 값뿐이거나
+ * 단계가 촘촘한 상품에서 차단값을 못 잡는다. 예약된 시각 단가의 p99 가 400,000원이라
+ * 50만원은 정상 단가 위쪽 바깥이다.
+ */
+const DUMMY_ABS = Number(process.env.DUMMY_PRICE_ABS ?? 500000);
+
 
 const db = pool();
 const c = await db.connect();
@@ -57,7 +64,7 @@ const r = await c.query(
         and k.hour = h.hour
       where not k.is_closed
    ),
-${pricingCTEs('$1', '$2')}
+${pricingCTEs('$1', '$2', '$4')}
    adj as (
      select space_id, coalesce(sum(cut), 0) as cut, count(*)::int as n_pkg
        from pkg_adj group by space_id
@@ -108,7 +115,7 @@ ${pricingCTEs('$1', '$2')}
      coalesce(j.n_pkg, 0)
    from agg a
    left join adj j on j.space_id = a.space_id`,
-  [date, DUMMY_MULT, FINAL_LEAD]
+  [date, DUMMY_MULT, FINAL_LEAD, DUMMY_ABS]
 );
 console.log(`space_settled: ${r.rowCount}곳`);
 

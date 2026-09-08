@@ -58,7 +58,17 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
      select e.*,
             -- 통상 단가의 N배 이상이면 팔 생각이 없는 값으로 본다.
             -- 예약(분자)에서도 영업시간(분모)에서도 뺀다. 휴무와 같은 취급이다.
-            (b.med_price > 0 and e.price >= b.med_price * __DUMMY__) as dummy,
+            --
+            -- 절대 상한도 같이 둔다. 상대 규칙만으로는 단가가 한 값뿐이거나
+            -- 단계가 촘촘한 상품에서 못 잡는다 — 공간 47087 은 25,000 / 140,000 /
+            -- 170,000 / 250,000 / 300,000 / 500,000 / 1,000,000 원이 섞여 있어
+            -- 어느 분위를 기준선으로 잡아도 위쪽 차단값이 살아남는다.
+            -- 예약된 시각 단가의 p99 가 400,000원이라 50만원은 정상 단가 위쪽
+            -- 바깥이다. 실측하면 이 상한에 걸리는 것은 6곳 2,050시각뿐이고
+            -- 값이 500,000 / 550,000 / 990,000 / 999,900 / 1,000,000 / 2,000,000 —
+            -- 전부 차단용 숫자다.
+            ((b.med_price > 0 and e.price >= b.med_price * __DUMMY__)
+             or e.price >= __DUMMY_ABS__) as dummy,
             -- 1인당 과금이면 기본가 자체가 1인 단가라 최소 인원을 곱해야 하한이 된다
             case when g.per_person then e.price * g.min_guest else e.price end as floor_amt,
             case when g.per_person then e.price * g.max_guest
@@ -162,8 +172,12 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
  * 강요받고, 하나를 고치면 다른 하나가 조용히 깨진다. 그래서 자리표시자로 받는다.
  *
  * @param snap  가격·인원·패키지 기준 관측일 placeholder (예: '$1')
- * @param dummy 더미 가격 배수 placeholder (예: '$4')
+ * @param dummy    더미 가격 배수 placeholder (예: '$4')
+ * @param dummyAbs 더미 절대 상한 placeholder (예: '$5')
  */
-export function pricingCTEs(snap, dummy) {
-  return TEMPLATE.replaceAll('__SNAP__', snap).replaceAll('__DUMMY__', dummy);
+export function pricingCTEs(snap, dummy, dummyAbs) {
+  return TEMPLATE
+    .replaceAll('__SNAP__', snap)
+    .replaceAll('__DUMMY_ABS__', dummyAbs)
+    .replaceAll('__DUMMY__', dummy);
 }
