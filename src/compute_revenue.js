@@ -28,8 +28,12 @@ const P = stage('revenue', date, { total: 1, note: '매출 환산 (수백만 행
 await c.query('begin');
 await c.query(`delete from space_revenue where observed_date = $1`, [date]);
 
+// EXPLAIN_ONLY=1 이면 실행 대신 계획만 뜬다. 다섯 시간짜리 쿼리를 고치려면
+// 어디서 시간을 쓰는지 먼저 봐야 하는데, 그걸 보려고 다섯 시간을 또 쓸 수는 없다.
+const EXPLAIN = process.env.EXPLAIN_ONLY ? 'explain (verbose false, costs true) ' : '';
+
 const r = await c.query(
-  `insert into space_revenue
+  EXPLAIN + `insert into space_revenue
      (space_id, observed_date, short_days, short_open_h, short_booked_h, short_fill,
       short_rev_day, rev_month_short, all_days, all_booked_h, all_fill, rev_month_all,
       rev_month_max, adr, dummy_h, dummy_rev,
@@ -132,6 +136,13 @@ ${pricingCTEs('$1', '$4')}
    left join adj j on j.space_id = a.space_id and j.observed_date = a.observed_date`,
   [date, SHORT_DAYS, DAYS_PER_MONTH, DUMMY_MULT]
 );
+if (EXPLAIN) {
+  console.log(r.rows.map((x) => x['QUERY PLAN']).join('\n'));
+  await c.query('rollback');
+  c.release();
+  await db.end();
+  process.exit(0);
+}
 console.log(`space_revenue: ${r.rowCount}곳`);
 
 await c.query('commit');
