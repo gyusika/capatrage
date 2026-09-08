@@ -7,6 +7,7 @@ import zlib from 'node:zlib';
 import readline from 'node:readline';
 import { fetchText, rateLimiter, today } from './lib/util.js';
 import { parseSpacePage } from './lib/nuxt.js';
+import { stage } from './lib/progress.js';
 
 const RPS = Number(process.env.CRAWL_RPS ?? 3);
 const CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY ?? 4);
@@ -37,6 +38,14 @@ if (LIMIT) ids = ids.slice(0, LIMIT);
 console.log(
   `크롤 시작: ${ids.length}건 (이미 완료 ${done.size}건) | ${RPS} req/s, 동시 ${CONCURRENCY}`
 );
+
+// 이어받은 몫도 진행에 포함한다. 재시도로 남은 건수가 줄면 화면의 막대가
+// 거꾸로 짧아 보이는데, 실제로는 앞 시도가 해놓은 일이 있기 때문이다.
+const P = stage('crawl', date, {
+  total: done.size + ids.length,
+  base: done.size,
+  note: `공간 상세 ${RPS} req/s 로 받는 중`,
+});
 
 const gz = zlib.createGzip();
 const out = fs.createWriteStream(path.join(snapDir, 'spaces.jsonl.gz'), { flags: 'a' });
@@ -100,6 +109,7 @@ async function worker() {
         `[${n}/${ids.length}] ok=${ok} gone=${gone} fail=${failed} ` +
           `${rate.toFixed(1)}/s ETA ${eta}분`
       );
+      P.set(done.size + n, { fail: failed, note: `공간 상세 ${rate.toFixed(1)} req/s` });
     }
   }
 }
@@ -108,3 +118,6 @@ await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 await new Promise((r) => gz.end(r));
 doneOut.end();
 console.log(`완료: ok=${ok} gone=${gone} fail=${failed} -> ${snapDir}/spaces.jsonl.gz`);
+
+P.set(done.size + ok + gone + failed, { fail: failed });
+await P.ok(`공간 ${ok}곳 수신 · 폐업/비공개 ${gone}곳 · 실패 ${failed}건`);

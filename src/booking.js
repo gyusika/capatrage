@@ -11,6 +11,7 @@ import readline from 'node:readline';
 import { rateLimiter, today, sleep } from './lib/util.js';
 import { parseAddr } from './lib/region.js';
 import { classify } from './lib/classify.js';
+import { stage } from './lib/progress.js';
 
 const API_BASE = process.env.SC_API_BASE ?? 'https://api.spacecloud.kr';
 const RPS = Number(process.env.BOOK_RPS ?? 2);
@@ -107,6 +108,12 @@ console.log(
   `+ 패키지 ${jobs.filter((j) => j.kind === 'pkg').length}개`
 );
 console.log(`요청 ${units.length}건 (완료 ${done.size}) | ${RPS} req/s, 동시 ${CONC}`);
+
+const P = stage('booking', date, {
+  total: done.size + units.length,
+  base: done.size,
+  note: `예약 달력 ${RPS} req/s 로 받는 중 (공간 ${spaceMeta.size}곳)`,
+});
 
 fs.writeFileSync(
   path.join(outDir, 'space_meta.json'),
@@ -212,6 +219,10 @@ async function worker() {
         `[${n}/${units.length}] ok=${ok} fail=${fail} 일자레코드=${slotDays} 패키지=${pkgDays} ` +
           `${(n / el).toFixed(1)}/s ETA ${Math.round((units.length - n) / (n / el) / 60)}분`
       );
+      P.set(done.size + n, {
+        fail,
+        note: `예약 달력 ${(n / el).toFixed(1)} req/s · 일자 ${slotDays.toLocaleString('ko-KR')}건`,
+      });
     }
   }
 }
@@ -220,3 +231,6 @@ await Promise.all(Array.from({ length: CONC }, worker));
 await new Promise((r) => gz.end(r));
 doneOut.end();
 console.log(`완료: ok=${ok} fail=${fail} 일자레코드=${slotDays} 패키지레코드=${pkgDays} -> ${outDir}/slots.jsonl.gz`);
+
+P.set(done.size + ok + fail, { fail });
+await P.ok(`일자레코드 ${slotDays.toLocaleString('ko-KR')}건 · 패키지 ${pkgDays.toLocaleString('ko-KR')}건 · 실패 ${fail}건`);

@@ -5,9 +5,12 @@ import zlib from 'node:zlib';
 import readline from 'node:readline';
 import { pool, insertBatch } from './lib/db.js';
 import { today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const date = process.env.LOAD_DATE ?? today();
 const dir = path.join('data', 'booking', date);
+
+const P = stage('load_booking', date, { total: 3, note: 'slots.jsonl.gz 읽는 중' });
 
 const db = pool();
 const client = await db.connect();
@@ -29,6 +32,7 @@ await insertBatch(
      break_holidays=excluded.break_holidays`
 );
 console.log(`space_hours: ${hourRows.length}건`);
+P.set(1, { note: `space_hours ${hourRows.length}건` });
 
 // ── 예약 현황 ────────────────────────────────────────────────────
 const rows = [];
@@ -83,6 +87,7 @@ const n = await insertBatch(
   400
 );
 console.log(`booking_day: ${n}건 적재 (과거일 제외 ${skippedPast}건)`);
+P.set(2, { note: `booking_day ${n.toLocaleString('ko-KR')}건 적재` });
 
 // ── 패키지 가격표 ────────────────────────────────────────────────
 // 같은 시간을 시간제보다 싸게 파는 창이다. 매출 하한이 여기서 나온다.
@@ -118,6 +123,9 @@ const s = await client.query(
 const r0 = s.rows[0];
 console.log(`공간 ${r0.spaces}곳 | ${r0.from_d} ~ ${r0.to_d} | ` +
   `예약 ${r0.booked}시간 / 전체 ${r0.slots}시간 = ${(r0.booked/r0.slots*100).toFixed(1)}%`);
+
+P.set(3);
+await P.ok(`공간 ${r0.spaces}곳 · 일자 ${Number(r0.rows).toLocaleString('ko-KR')}건`);
 
 client.release();
 await db.end();

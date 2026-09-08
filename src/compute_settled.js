@@ -7,8 +7,10 @@
 //
 // 관측이 30일 쌓이기 전에는 "한 달치"가 아니다. n_days 를 반드시 같이 낸다.
 import { pool } from './lib/db.js';
+import { prepBatch } from './lib/batch.js';
 import { pricingCTEs } from './lib/revenue_sql.js';
 import { today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const date = process.env.LOAD_DATE ?? today();
 /** 관측이 이 날짜보다 며칠 이내면 사실상 최종으로 본다. */
@@ -17,9 +19,11 @@ const DUMMY_MULT = Number(process.env.DUMMY_PRICE_MULT ?? 10);
 
 const db = pool();
 const c = await db.connect();
-await c.query(`set statement_timeout = 0`);
+await prepBatch(c, { name: `capatrage-settled-${date}` });
 
 console.log(`기준 관측일 ${date} | 확정 판정 D-${FINAL_LEAD} 이내`);
+
+const P = stage('settled', date, { total: 1, note: '지나간 날짜 실측 매출 (곱셈 없음)' });
 
 await c.query('begin');
 await c.query(`delete from space_settled where as_of = $1`, [date]);
@@ -58,23 +62,40 @@ ${pricingCTEs('$1', '$2')}
      select space_id, coalesce(sum(cut), 0) as cut, count(*)::int as n_pkg
        from pkg_adj group by space_id
    ),
-   agg as (
+   -- 분모: 열려 있던 모든 시각. 갈래를 나눈 이유는 revenue_sql 의 numbered 주석에 있다.
+   agg_open as (
      select space_id,
        min(target_date) as from_date,
        max(target_date) as to_date,
        count(distinct target_date) filter (where not coalesce(dummy, false))        as n_days,
        count(distinct target_date) filter (
          where not coalesce(dummy, false) and lead_days <= $3)                      as n_days_final,
-       count(*) filter (where not coalesce(dummy, false))                           as open_h,
-       count(*) filter (where sold)                                                 as booked_h,
-       coalesce(sum(floor_amt) filter (where sold), 0)                              as rev,
-       coalesce(sum(ceil_amt)  filter (where sold), 0)
-         + coalesce(sum(block_add) filter (where block_start), 0)                   as rev_ceil,
-       -- 확정된 날짜만으로 낸 하루 평균. 과소인 날을 섞지 않은 값이다.
-       coalesce(sum(floor_amt) filter (where sold and lead_days <= $3), 0)          as rev_final,
-       count(distinct target_date) filter (
-         where not coalesce(dummy, false) and lead_days <= $3)                      as days_final
-       from blocked group by space_id
+       count(*) filter (where not coalesce(dummy, false))                           as open_h
+       from flagged group by space_id
+   ),
+   -- 분자: 실제로 팔린 시각만.
+   agg_sold as (
+     select space_id,
+       count(*)                                                as booked_h,
+       coalesce(sum(floor_amt), 0)                             as rev,
+       coalesce(sum(ceil_amt), 0)                              as rev_ceil_h,
+       -- 확정된 날짜만으로 낸 합. 과소인 날을 섞지 않은 값이다.
+       coalesce(sum(floor_amt) filter (where lead_days <= $3), 0) as rev_final
+       from numbered group by space_id
+   ),
+   agg_blk as (
+     select space_id, coalesce(sum(block_add), 0) as block_add from blk_agg group by space_id
+   ),
+   agg as (
+     select o.space_id, o.from_date, o.to_date, o.n_days, o.n_days_final, o.open_h,
+       coalesce(s.booked_h, 0)                                     as booked_h,
+       coalesce(s.rev, 0)                                          as rev,
+       coalesce(s.rev_ceil_h, 0) + coalesce(k.block_add, 0)        as rev_ceil,
+       coalesce(s.rev_final, 0)                                    as rev_final,
+       o.n_days_final                                              as days_final
+       from agg_open o
+       left join agg_sold s on s.space_id = o.space_id
+       left join agg_blk  k on k.space_id = o.space_id
    )
    select a.space_id, $1::date, a.from_date, a.to_date,
      a.n_days::int, a.n_days_final::int,
@@ -131,6 +152,9 @@ if (cx.n > 0) {
     `  두 값이 크게 벌어지면 D+1~3 을 대표로 쓰는 가정을 다시 봐야 한다.`
   );
 }
+
+P.set(1);
+await P.ok(`공간 ${r.rowCount.toLocaleString('ko-KR')}곳 · 실측 ${x.max_days ?? 0}일치`);
 
 c.release();
 await db.end();

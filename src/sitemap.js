@@ -6,12 +6,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fetchText, today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const OUT = path.join('data', 'sitemap', today());
 const SITEMAP = 'https://www.spacecloud.kr/sitemap.xml';
 
+const P = stage('sitemap', today(), { total: 1, note: 'sitemap.xml 내려받는 중' });
+
 fs.mkdirSync(OUT, { recursive: true });
 const { text } = await fetchText(SITEMAP, { timeoutMs: 180000 });
+P.note('sitemap.xml 파싱 중');
 fs.writeFileSync(path.join(OUT, 'sitemap.xml'), text);
 
 const spaces = [];
@@ -42,3 +46,6 @@ console.log(
     `review_id ${reviews[0].review_id}~${reviews.at(-1).review_id})`
 );
 console.log(`-> ${OUT}`);
+
+P.set(1, { note: `공간 ${spaces.length}개 · 리뷰 ${reviews.length}건 열거` });
+await P.ok();

@@ -4,8 +4,10 @@
 // 리드타임 곡선이 D+1 5.0% → D+21 0.8% 로 떨어진다. 3주 뒤 예약률은 수요가 아니라 시기의 문제다.
 // 내일·모레 예약은 사실상 확정이므로 그걸 운영 상황의 근사로 쓴다.
 import { pool } from './lib/db.js';
+import { prepBatch } from './lib/batch.js';
 import { pricingCTEs } from './lib/revenue_sql.js';
 import { today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const date = process.env.LOAD_DATE ?? today();
 const SHORT_DAYS = Number(process.env.SHORT_LEAD_DAYS ?? 3); // D+1 ~ D+3
@@ -16,10 +18,12 @@ const DUMMY_MULT = Number(process.env.DUMMY_PRICE_MULT ?? 10);
 
 const db = pool();
 const c = await db.connect();
-// 전수 재계산은 2분(서버 기본값)을 넘긴다. 배치 잡이므로 푼다.
-await c.query(`set statement_timeout = 0`);
+await prepBatch(c, { name: `capatrage-revenue-${date}` });
 
 console.log(`관측일 ${date} | 단기 기준 D+1~D+${SHORT_DAYS} | 더미 가격 경계 통상단가의 ${DUMMY_MULT}배`);
+
+// 한 방 쿼리라 중간 진행이 없다. 도는 중이라는 것만 알리고 끝나면 결과를 남긴다.
+const P = stage('revenue', date, { total: 1, note: '매출 환산 (수백만 행 집계, 수십 분)' });
 
 await c.query('begin');
 await c.query(`delete from space_revenue where observed_date = $1`, [date]);
@@ -56,26 +60,54 @@ ${pricingCTEs('$1', '$4')}
             count(*)::int                                        as n_pkg_blocks
        from pkg_adj group by space_id, observed_date
    ),
-   agg as (
+   -- 분모: 열려 있는 모든 시각. 예약 여부와 무관하다.
+   agg_open as (
      select space_id, observed_date,
        count(distinct target_date) filter (where lead_days <= $2 and not coalesce(dummy, false)) as short_days,
        count(*) filter (where lead_days <= $2 and not coalesce(dummy, false))                    as short_open_h,
-       count(*) filter (where lead_days <= $2 and sold)                                          as short_booked_h,
-       coalesce(sum(floor_amt) filter (where lead_days <= $2 and sold), 0)                       as short_rev,
-       coalesce(sum(ceil_amt)  filter (where lead_days <= $2 and sold), 0)
-         + coalesce(sum(block_add) filter (where lead_days <= $2 and block_start), 0)            as short_rev_ceil,
        count(distinct target_date) filter (where not coalesce(dummy, false))                     as all_days,
        count(*) filter (where not coalesce(dummy, false))                                        as all_open_h,
-       count(*) filter (where sold)                                                              as all_booked_h,
-       coalesce(sum(floor_amt) filter (where sold), 0)                                           as all_rev,
-       coalesce(sum(ceil_amt)  filter (where sold), 0)
-         + coalesce(sum(block_add) filter (where block_start), 0)                                as all_rev_ceil,
        coalesce(sum(floor_amt) filter (where not coalesce(dummy, false)), 0)                     as max_rev,
-       avg(floor_amt) filter (where sold)                                                        as adr,
        count(*) filter (where booked and coalesce(dummy, false))                                 as dummy_h,
-       coalesce(sum(price) filter (where booked and coalesce(dummy, false)), 0)                  as dummy_rev,
-       count(*) filter (where block_start)                                                       as n_blocks
-       from blocked group by space_id, observed_date
+       coalesce(sum(price) filter (where booked and coalesce(dummy, false)), 0)                  as dummy_rev
+       from flagged group by space_id, observed_date
+   ),
+   -- 분자: 팔린 시각만. 예전엔 이것도 flagged 위에서 filter 로 냈지만, 그러면
+   -- 덩어리 판정 때문에 1,320만 행을 정렬해야 했다. 갈래를 나눠 220만 행만 만진다.
+   agg_sold as (
+     select space_id, observed_date,
+       count(*) filter (where lead_days <= $2)                            as short_booked_h,
+       coalesce(sum(floor_amt) filter (where lead_days <= $2), 0)         as short_rev,
+       coalesce(sum(ceil_amt)  filter (where lead_days <= $2), 0)         as short_rev_ceil_h,
+       count(*)                                                          as all_booked_h,
+       coalesce(sum(floor_amt), 0)                                       as all_rev,
+       coalesce(sum(ceil_amt), 0)                                        as all_rev_ceil_h,
+       avg(floor_amt)                                                    as adr
+       from numbered group by space_id, observed_date
+   ),
+   -- 건당 추가금은 덩어리마다 한 번 붙는다.
+   agg_blk as (
+     select space_id, observed_date,
+       coalesce(sum(block_add) filter (where lead_days <= $2), 0) as short_block_add,
+       coalesce(sum(block_add), 0)                                as all_block_add,
+       count(*)::int                                              as n_blocks
+       from blk_agg group by space_id, observed_date
+   ),
+   agg as (
+     select o.space_id, o.observed_date,
+       o.short_days, o.short_open_h, o.all_days, o.all_open_h,
+       o.max_rev, o.dummy_h, o.dummy_rev,
+       coalesce(s.short_booked_h, 0)                                as short_booked_h,
+       coalesce(s.short_rev, 0)                                     as short_rev,
+       coalesce(s.short_rev_ceil_h, 0) + coalesce(k.short_block_add, 0) as short_rev_ceil,
+       coalesce(s.all_booked_h, 0)                                  as all_booked_h,
+       coalesce(s.all_rev, 0)                                       as all_rev,
+       coalesce(s.all_rev_ceil_h, 0) + coalesce(k.all_block_add, 0) as all_rev_ceil,
+       s.adr,
+       coalesce(k.n_blocks, 0)                                      as n_blocks
+       from agg_open o
+       left join agg_sold s on s.space_id = o.space_id and s.observed_date = o.observed_date
+       left join agg_blk  k on k.space_id = o.space_id and k.observed_date = o.observed_date
    )
    select a.space_id, a.observed_date,
      a.short_days::int, a.short_open_h::int, a.short_booked_h::int,
@@ -185,6 +217,9 @@ console.log(
   `  하한 ${won(gx.lo)} ~ 상한 ${won(gx.hi)}  (상한/하한 ${gx.mult}배)\n` +
   `  예약 덩어리 ${Number(gx.blocks).toLocaleString('ko-KR')}건 — 건당 추가금은 덩어리마다 한 번 붙였다`
 );
+
+P.set(1);
+await P.ok(`공간 ${r.rowCount.toLocaleString('ko-KR')}곳 매출 구간 산출`);
 
 c.release();
 await db.end();

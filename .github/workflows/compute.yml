@@ -30,7 +30,9 @@ concurrency:
 jobs:
   compute:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 매출 환산이 가장 작은 관측일에서도 50분을 넘긴다. 예전 180분 제한에 걸려
+    # 취소된 실행이 세 번 있었다. 러너 상한(6시간) 바로 아래로 잡는다.
+    timeout-minutes: 350
     env:
       RUN_DATE: ${{ inputs.run_date }}
     steps:
@@ -52,12 +54,19 @@ jobs:
         run: npm run compute
 
       - name: 매출 집계
+        continue-on-error: true
         run: npm run revenue
 
       # 지나간 날짜를 실제로 세서 낸 매출. 곱셈이 없다.
       # 관측이 쌓일수록 실측 일수가 늘고, 30일이 차면 진짜 월매출이 된다.
       - name: 실측 매출
+        continue-on-error: true
         run: npm run settled
+
+      # 여기까지 못 채운 것이 있으면 찾아서 다시 낸다.
+      - name: 밀린 집계 자가복구
+        if: always()
+        run: npm run backfill
 
       - name: 결과 요약
         if: always()

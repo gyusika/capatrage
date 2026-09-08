@@ -7,6 +7,7 @@ import { pool, insertBatch } from './lib/db.js';
 import { classify } from './lib/classify.js';
 import { parseAddr, buildDongNames } from './lib/region.js';
 import { today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const date = process.env.LOAD_DATE ?? today();
 const snapDir = path.join('data', 'snapshots', date);
@@ -30,6 +31,8 @@ for (let i = smSpaces.length - 1; i >= 0; i--) {
   vintage.set(s.space_id, suffixMin.slice(0, 7) + '-01');
 }
 const lastmodOf = new Map(smSpaces.map((s) => [s.space_id, s.lastmod]));
+
+const P = stage('load', date, { total: 5, note: '스냅샷 읽는 중' });
 
 const db = pool();
 const client = await db.connect();
@@ -203,6 +206,7 @@ await insertBatch(client, 'space_snapshot',
    'break_days','latest_review_at'],
   snapRows, 'on conflict (space_id, snapshot_date) do nothing');
 console.log(`space_snapshot: ${snapRows.length}건`);
+P.set(2, { note: `space_snapshot ${snapRows.length}건` });
 
 await insertBatch(client, 'product_snapshot',
   ['space_id','product_id','snapshot_date','name','price','rsv_tp_cd','charging_per_person',
@@ -212,12 +216,14 @@ await insertBatch(client, 'product_snapshot',
   `on conflict (space_id, product_id, snapshot_date) do update
      set min_guest_policy = excluded.min_guest_policy`);
 console.log(`product_snapshot: ${prodRows.length}건`);
+P.set(3, { note: `product_snapshot ${prodRows.length}건` });
 
 await insertBatch(client, 'rsv_type_snapshot',
   ['space_id','product_id','rsv_type_id','snapshot_date','rsv_tp_cd','price',
    'charging_per_person','person_ceiling','extra_person_price','extra_per_hour'],
   rsvRows, 'on conflict (space_id, product_id, rsv_type_id, snapshot_date) do nothing');
 console.log(`rsv_type_snapshot: ${rsvRows.length}건`);
+P.set(4, { note: `rsv_type_snapshot ${rsvRows.length}건` });
 
 await insertBatch(client, 'space_tag', ['space_id','tag','rank'], tagRows,
   'on conflict (space_id, tag) do nothing');
@@ -234,3 +240,6 @@ await client.query(
 client.release();
 await db.end();
 console.log('적재 완료');
+
+P.set(5);
+await P.ok(`공간 ${ok}곳 · 상품 ${prodRows.length}개 적재`);

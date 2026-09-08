@@ -57,6 +57,11 @@ jobs:
         run: |
           printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
 
+      # 새 마이그레이션이 있어도 사람이 손으로 적용하러 오지 않게 한다.
+      # 전부 create ... if not exists / create or replace 라 몇 번 돌려도 같다.
+      - name: 스키마 반영
+        run: npm run sql -- sql/*.sql
+
       # 실패 후 재실행할 때 done.txt 로 이어받는다
       - name: 진행분 복원
         uses: actions/cache/restore@v4
@@ -70,8 +75,16 @@ jobs:
         env:
           RUN_DATE: ${{ steps.d.outputs.date }}
 
+      # done.txt 로 이어받으므로 재시도가 처음부터 다시 받지 않는다.
+      # 상대 서버가 잠깐 흔들려 죽는 것 때문에 하루치를 통째로 잃지 않게 한다.
       - name: 상세 전수 크롤
-        run: npm run crawl
+        run: |
+          for i in 1 2 3; do
+            npm run crawl && exit 0
+            echo "크롤 ${i}차 실패. 남은 것만 이어서 다시 받는다."
+            sleep 60
+          done
+          exit 1
         env:
           RUN_DATE: ${{ steps.d.outputs.date }}
           CRAWL_RPS: '3'
@@ -141,7 +154,13 @@ jobs:
 
       # TARGET_SIDO=11 (서울). booking.js 의 기본값이라 명시만 해둔다.
       - name: 예약 현황 수집
-        run: npm run booking
+        run: |
+          for i in 1 2 3; do
+            npm run booking && exit 0
+            echo "예약 수집 ${i}차 실패. done.txt 뒤부터 다시 받는다."
+            sleep 60
+          done
+          exit 1
         env:
           TARGET_SIDO: '11'
           BOOK_RPS: '2'
@@ -154,7 +173,11 @@ jobs:
           path: data/booking/${{ needs.crawl.outputs.run_date }}
           key: booking-${{ needs.crawl.outputs.run_date }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # 수집이 중간에 끊겨도 받아둔 만큼은 넣는다. booking_day 는 upsert 라
+      # 다음 날 재시도가 같은 행을 덮을 뿐이고, 부분이라도 있는 편이 낫다 —
+      # 지나간 날짜의 달력은 API 가 다시 주지 않는다.
       - name: 예약 적재
+        if: always()
         run: npm run load:booking
 
       - name: 수집 결과 요약
@@ -180,38 +203,108 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # ── 3단계: 집계 (~40분) ──────────────────────────────────────────
-  # 수집 잡에서 떼어냈다. 이 단계는 DB 만 읽고 쓰므로 스냅샷이 필요 없고,
-  # 수집이 4시간을 쓰고 나면 같은 잡 안에서는 6시간 상한에 걸린다.
-  # 실제로 09-06·09-07 관측분이 여기서 죽어서 파생 테이블이 열흘 넘게 08-26 에 멈춰 있었다.
-  # 잡을 나누면 집계가 실패해도 수집분은 남고, 이 잡만 재실행하면 된다.
-  compute:
+  # ── 3단계: 집계 ─────────────────────────────────────────────────
+  #
+  # 왜 잡을 셋으로 쪼갰는가. GitHub 호스티드 러너는 잡 하나에 6시간이 상한이다.
+  # 매출 환산은 가장 작은 관측일(39만 행)에서도 50분을 넘겼고, 관측일이 55만 행으로
+  # 늘면 더 걸린다. 셋을 한 잡에 넣으면 상한에 걸려 통째로 잘리고, 잘리면 그날
+  # 집계가 전부 없어진다 — 실제로 3시간 제한에 걸려 취소된 실행이 세 번 있었다.
+  # 나누면 각자 6시간을 따로 받고, 하나가 잘려도 앞 단계 결과는 남는다.
+  #
+  # 앞 단계가 실패해도 뒤를 건너뛰지 않는다(!cancelled). 뒤 단계가 앞 결과를
+  # 정말 필요로 하면 자기가 실패할 것이고, 남은 구멍은 마지막 자가복구가 메운다.
+
+  # 영업시간 판정 + 예약률. 지도·순위표·시간대 화면이 이걸 본다.
+  fill:
     needs: [crawl, booking]
+    if: ${{ !cancelled() && needs.crawl.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
     env:
       RUN_DATE: ${{ needs.crawl.outputs.run_date }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-
       - run: npm ci
-
       - name: .env 생성
-        run: |
-          printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
-
+        run: printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
       - name: 영업시간 판정 + 예약률
         run: npm run compute
 
+  # 매출 환산(D+1~3 × 30.4). 가장 무거운 단계다.
+  revenue:
+    needs: [crawl, fill]
+    if: ${{ !cancelled() && needs.crawl.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RUN_DATE: ${{ needs.crawl.outputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: .env 생성
+        run: printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
       - name: 매출 집계
         run: npm run revenue
 
-      # 지나간 날짜를 실제로 세서 낸 매출. 곱셈이 없다.
-      # 관측이 쌓일수록 실측 일수가 늘고, 30일이 차면 진짜 월매출이 된다.
+  # 지나간 날짜를 실제로 세서 낸 매출. 곱셈이 없다.
+  # 관측이 쌓일수록 실측 일수가 늘고, 30일이 차면 진짜 월매출이 된다.
+  settled:
+    needs: [crawl, revenue]
+    if: ${{ !cancelled() && needs.crawl.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RUN_DATE: ${{ needs.crawl.outputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: .env 생성
+        run: printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
       - name: 실측 매출
         run: npm run settled
+
+  # ── 4단계: 자가복구 ─────────────────────────────────────────────
+  # booking_day 에는 있는데 파생 테이블에 없는 관측일을 찾아 다시 낸다.
+  # 오늘이 전부 성공했으면 할 일이 없고, 어제 것이 빠졌으면 오늘 메운다.
+  # 이게 없어서 09-06·09-07 관측분이 열흘 넘게 밀려 있었다.
+  heal:
+    needs: [crawl, fill, revenue, settled]
+    if: ${{ always() && needs.crawl.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RUN_DATE: ${{ needs.crawl.outputs.run_date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: .env 생성
+        run: printf 'DATABASE_URL=%s\n' "${{ secrets.DATABASE_URL }}" > .env
+
+      - name: 밀린 집계 자가복구
+        run: npm run backfill
+
+      - name: 결과 요약
+        if: always()
+        run: |
+          {
+            echo "## 집계 ${RUN_DATE}"
+            echo "- 예약률: ${{ needs.fill.result }}"
+            echo "- 매출 환산: ${{ needs.revenue.result }}"
+            echo "- 매출 실측: ${{ needs.settled.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"

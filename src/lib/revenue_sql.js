@@ -6,8 +6,13 @@
  * 두 곳에서 갈라지면 두 숫자를 나란히 놓을 수 없다. 그래서 한 곳에 둔다.
  *
  * 호출자가 ex 를 정의해서 넘긴다. ex 는 아래 컬럼을 가져야 한다:
- *   space_id, product_id, rsv_type_id, target_date, hour, booked, price
- * 그리고 집계에 쓸 자기만의 컬럼(observed_date, lead_days 등)을 더 실어도 된다.
+ *   space_id, product_id, rsv_type_id, observed_date, target_date, lead_days,
+ *   hour, booked, price
+ *
+ * 호출자는 세 곳에서 집계한다. 갈래를 나눈 이유는 아래 numbered 주석에 있다.
+ *   flagged  — 열려 있는 모든 시각 (분모·더미·잠재매출)
+ *   numbered — 그중 팔린 시각만 (분자·매출)
+ *   blk_agg  — 팔린 시각을 연속 덩어리로 묶은 것 (건당 추가금·패키지 보정)
  *
  * __SNAP__ = 가격·인원·패키지 기준으로 삼을 관측일(스냅샷 날짜).
  */
@@ -60,39 +65,29 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
        left join guest g on g.space_id = e.space_id and g.product_id = e.product_id
                         and g.rsv_type_id = e.rsv_type_id
    ),
-   -- 연속된 예약 시간을 하나의 예약 건으로 본다. 건당 추가금을 몇 번 붙일지의 근거다.
+   -- 연속된 예약 시간을 하나의 예약 건으로 본다. 건당 추가금을 몇 번 붙일지,
+   -- 그리고 그 구간이 패키지 창과 맞는지의 근거다.
    -- 서로 다른 사람의 인접 예약은 하나로 합쳐져 상한이 낮게 잡힌다(보수적).
-   marked as (
-     select f.*,
-            (f.booked and not coalesce(f.dummy, false)) as sold,
-            lag(f.hour) over w                          as prev_hour,
-            lag(f.booked and not coalesce(f.dummy, false)) over w as prev_sold
-       from flagged f
-       window w as (partition by f.space_id, f.product_id, f.rsv_type_id, f.target_date
-                    order by f.hour)
-   ),
-   blocked as (
-     select m.*,
-            (m.sold and (m.prev_hour is null or m.prev_hour <> m.hour - 1
-                         or not coalesce(m.prev_sold, false))) as block_start
-       from marked m
-   ),
-   -- 덩어리마다 번호를 매겨 [시작시각, 끝시각] 을 뽑는다. 패키지 창과 맞출 단위다.
-   -- 예약된 시각만 남기고 나서 번호를 매긴다. block_start 는 예약된 행에서만 참이라
-   -- 안 팔린 행은 누적합에 0을 더할 뿐이고, 먼저 걸러도 번호가 같다.
-   -- 1,320만 행 위에서 윈도우를 돌리면 40분이 넘는다. 걸러내면 220만 행이다.
+   --
+   -- hour - row_number() 는 연속된 시각 안에서 값이 일정하다. 그 값이 덩어리 번호다.
+   -- 안 팔린 시각을 먼저 버리고 번호를 매기는 게 핵심이다. 예전 구조는 lag 로
+   -- 앞 행이 팔렸는지를 봐야 해서 열린 시각 전부(1,320만 행)를 정렬해야 했고,
+   -- work_mem 이 3.5MB 라 그 정렬이 통째로 디스크로 나갔다. 팔린 행만 남기면
+   -- 220만 행이고, 앞 행이 h-1 이라는 것은 h-1 이 팔렸다는 뜻이므로 판정이 같다.
    numbered as (
-     select b.space_id, b.product_id, b.rsv_type_id, b.observed_date, b.target_date,
-            b.lead_days, b.hour, b.floor_amt,
-            sum(case when b.block_start then 1 else 0 end) over (
-              partition by b.space_id, b.product_id, b.rsv_type_id, b.target_date
-              order by b.hour rows unbounded preceding) as blk
-       from blocked b
-      where b.sold
+     select f.*,
+            f.hour - row_number() over (
+              partition by f.space_id, f.product_id, f.rsv_type_id, f.target_date
+              order by f.hour) as blk
+       from flagged f
+      where f.booked and not coalesce(f.dummy, false)
    ),
    blk_agg as (
      select space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk,
-            min(hour) as h0, max(hour) as h1, sum(floor_amt) as blk_floor
+            min(hour) as h0, max(hour) as h1,
+            sum(floor_amt) as blk_floor,
+            -- block_add 는 상품·예약타입마다 하나로 정해진 값이라 덩어리 안에서 일정하다
+            max(block_add) as block_add
        from numbered
       group by space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk
    ),

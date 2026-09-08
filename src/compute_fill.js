@@ -2,6 +2,7 @@
 // 매 페이지 요청마다 24배 cross join 을 돌리지 않기 위해 적재 직후 한 번만 돌린다.
 import { pool } from './lib/db.js';
 import { today } from './lib/util.js';
+import { stage } from './lib/progress.js';
 
 const date = process.env.LOAD_DATE ?? today();
 const MIN_DAYS = Number(process.env.CLOSED_MIN_DAYS ?? 14);
@@ -13,6 +14,8 @@ const c = await db.connect();
 await c.query(`set statement_timeout = 0`);
 
 console.log(`관측일 ${date} | 영업시간 판정 최소 관측일수 ${MIN_DAYS}일`);
+
+const P = stage('fill', date, { total: 5, note: '영업시간 판정' });
 
 await c.query('begin');
 
@@ -33,6 +36,7 @@ const r1 = await c.query(
   [date, MIN_DAYS]
 );
 console.log(`booking_hour_class: ${r1.rowCount}건`);
+P.set(1, { note: '공간별 예약률 집계' });
 
 // ── 2. 공간 단위 집계 ────────────────────────────────────────────
 await c.query(`delete from booking_space_fill where observed_date = $1`, [date]);
@@ -76,6 +80,7 @@ const r2 = await c.query(
   [date]
 );
 console.log(`booking_space_fill: ${r2.rowCount}건`);
+P.set(2, { note: '캘린더 차단 판별' });
 
 // ── 2b. 캘린더 차단 판별 ─────────────────────────────────────────
 // 실제 예약은 날짜마다 시각 조합이 다르다. 차단은 매일 똑같다.
@@ -122,6 +127,7 @@ const r2b = await c.query(
   [date]
 );
 console.log(`차단 판별: ${r2b.rowCount}곳 갱신`);
+P.set(3, { note: '요일×시간 히트맵' });
 
 // ── 3. 요일×시간 히트맵 ──────────────────────────────────────────
 await c.query(`delete from booking_heat where observed_date = $1`, [date]);
@@ -152,6 +158,7 @@ const r3 = await c.query(
   [date]
 );
 console.log(`booking_heat: ${r3.rowCount}건`);
+P.set(4, { note: '리드타임별 예약률' });
 
 // ── 4. 리드타임별 예약률 ─────────────────────────────────────────
 await c.query(`delete from booking_lead where observed_date = $1`, [date]);
@@ -183,6 +190,7 @@ const r4 = await c.query(
   [date]
 );
 console.log(`booking_lead: ${r4.rowCount}건`);
+P.set(5, { note: '커밋' });
 
 await c.query('commit');
 
@@ -213,6 +221,8 @@ console.log(
   `차단 의심 ${b2.suspect}곳 (예약 있는 ${b2.with_any}곳 중 ${b2.any_suspect}곳) | ` +
   `차단 제외 예약률 중앙값 ${b2.med_clean}%`
 );
+
+await P.ok(`공간 ${r2.rowCount}곳 예약률 · 시각 판정 ${r1.rowCount.toLocaleString('ko-KR')}건`);
 
 c.release();
 await db.end();
