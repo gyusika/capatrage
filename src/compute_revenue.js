@@ -198,7 +198,7 @@ const pkgAll = await c.query(
 const pax = pkgAll.rows[0];
 console.log(
   `\n패키지 가격표 ${Number(pax.rows).toLocaleString('ko-KR')}행 / ${pax.spaces}곳` +
-  (pax.wrap ? ` (자정을 넘는 창 ${pax.wrap}행은 제외)` : '') + '\n' +
+  (pax.wrap ? ` (자정을 넘는 창 ${pax.wrap}행은 다음 날 새벽과 짝지어 맞춘다)` : '') + '\n' +
   (pkx.blocks
     ? `  예약 덩어리 ${Number(pkx.blocks).toLocaleString('ko-KR')}건이 패키지 창과 정확히 일치해 ` +
       `${pkx.spaces}곳의 하한을 패키지가로 다시 잡았다\n` +

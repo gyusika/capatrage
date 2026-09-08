@@ -110,7 +110,7 @@ if (pkgRows.length) {
     400
   );
   const wrap = pkgRows.filter((r) => r[7] >= r[8]).length;
-  console.log(`booking_package: ${np}건 적재 (자정을 넘는 창 ${wrap}건 — 매출 보정에서는 제외된다)`);
+  console.log(`booking_package: ${np}건 적재 (자정을 넘는 창 ${wrap}건 — 다음 날 새벽과 짝지어 맞춘다)`);
 } else {
   console.log('booking_package: 0건 (이번 수집분에 패키지가 없다)');
 }

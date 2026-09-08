@@ -19,9 +19,18 @@
 const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선이다.
    -- 절대 금액으로 자르면 업종별 정상 단가 차이(연습실 9천 ~ 숙박 7만)에 걸린다.
    -- ex 가 아니라 booking_day 에서 직접 뽑는다. ex 를 두 번 훑으면 2분을 넘긴다.
+   --
+   -- 중앙값이 아니라 하위 25%를 쓴다. 더미가 과반이면 중앙값 자체가 더미가 되어
+   -- 판정이 무력화되기 때문이다 — 공간 72659 는 단가가 29,000원 198시각 /
+   -- 39,000원 120시각 / 1,000,000원 954시각이라 중앙값이 1,000,000원이었다.
+   -- 기준선이 100만원이면 100만원짜리가 "통상 단가"가 되어 예약 7시간이 700만원으로
+   -- 세어진다. 더미는 항상 높은 쪽이므로 하위 분위는 오염되지 않는다.
+   --
+   -- 실측 영향은 좁다. 새로 더미로 걸리는 시각 6,428개 중 실제 예약된 것은
+   -- 138개(3곳)뿐이다. 오염된 곳만 잡고 정상 상품의 판정은 그대로다.
    base as (
      select b.space_id, b.product_id, b.rsv_type_id,
-            percentile_cont(0.5) within group (order by p) as med_price
+            percentile_cont(0.25) within group (order by p) as med_price
        from booking_day b, unnest(b.hour_prices) p
       where b.observed_date = __SNAP__ and p is not null and p > 0
       group by b.space_id, b.product_id, b.rsv_type_id
@@ -92,17 +101,32 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
       group by space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk
    ),
    -- 패키지 가격표. 같은 구간을 시간제 합계보다 싸게 파는 창이다.
-   -- 자정을 넘는 창(shour >= ehour)은 하루 단위 덩어리와 맞출 수 없어 뺀다.
    -- 1인당 과금 패키지면 기본가가 1인 단가라 최소 인원을 곱해야 하한이 된다.
-   pkg as (
+   pkg_all as (
      select p.space_id, p.product_id, p.target_date, p.shour, p.ehour,
             min(case when coalesce(g.per_person, false) then p.price * g.min_guest
                      else p.price end) as pkg_floor
        from booking_package p
        left join guest g on g.space_id = p.space_id and g.product_id = p.product_id
                         and g.rsv_type_id = p.rsv_type_id
-      where p.observed_date = __SNAP__ and p.shour < p.ehour and p.price > 0
+      where p.observed_date = __SNAP__ and p.price > 0
       group by p.space_id, p.product_id, p.target_date, p.shour, p.ehour
+   ),
+   -- 하루 안에서 끝나는 창.
+   pkg as (
+     select * from pkg_all where shour < ehour
+   ),
+   -- 자정을 넘는 창(올나잇 19~9시 같은 것). 예전엔 통째로 뺐는데, 그러면 그 구간이
+   -- 시간제 합계로 계산돼 하한이 크게 과대해진다 — 공간 74972 는 올나잇 19~9시가
+   -- 120,000원인데 같은 14시간을 시간제로 세면 42만~98만원이다. 3~8배 차이다.
+   -- 코너 케이스도 아니다. 패키지 행의 19%, 패키지를 가진 공간의 36%(1,185곳)가
+   -- 자정을 넘는 창을 갖고 있다.
+   --
+   -- 하루 단위 덩어리 하나로는 못 맞추지만 두 개로는 맞출 수 있다 — 그 날 [shour..23]
+   -- 과 다음 날 [0..ehour-1] 이 둘 다 정확히 일치하면 그 창으로 팔린 것이다.
+   -- ehour = 0 인 창은 자정에 끝나므로 다음 날 몫이 없다. 하루 안 창과 같아서 여기서 뺀다.
+   pkg_over as (
+     select * from pkg_all where shour >= ehour and ehour > 0
    ),
    -- 예약 덩어리가 패키지 창과 정확히 일치하면 그 덩어리는 패키지로 팔렸을 수 있다.
    -- 어느 쪽으로 팔렸는지는 관측되지 않으므로 하한에는 싼 값(패키지가)을 쓴다.
@@ -116,6 +140,21 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
                  and k.target_date = a.target_date
                  and k.shour = a.h0 and k.ehour = a.h1 + 1
       where k.pkg_floor < a.blk_floor
+     union all
+     -- 자정을 넘는 창: 그 날 끝 덩어리와 다음 날 첫 덩어리를 짝지어 하나로 본다.
+     -- 깎인 금액은 창이 시작한 날짜에 붙인다. 그 날 팔린 예약이기 때문이다.
+     select a.space_id, a.observed_date, a.lead_days,
+            a.blk_floor + b.blk_floor - k.pkg_floor as cut
+       from blk_agg a
+       join pkg_over k on k.space_id = a.space_id and k.product_id = a.product_id
+                      and k.target_date = a.target_date
+                      and k.shour = a.h0 and a.h1 = 23
+       join blk_agg b on b.space_id = a.space_id and b.product_id = a.product_id
+                     and b.rsv_type_id = a.rsv_type_id
+                     and b.observed_date = a.observed_date
+                     and b.target_date = a.target_date + 1
+                     and b.h0 = 0 and b.h1 = k.ehour - 1
+      where k.pkg_floor < a.blk_floor + b.blk_floor
    ),`;
 
 /**
