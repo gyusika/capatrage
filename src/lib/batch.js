@@ -28,5 +28,6 @@ export async function prepBatch(c, { name } = {}) {
     await c.query(`select pg_terminate_backend($1)`, [row.pid]);
     console.log(`앞선 실행 정리: pid ${row.pid} (${row.secs}초째 돌던 중)`);
   }
-  await c.query(`set application_name = $1`, [name]);
+  // SET 은 파라미터를 못 받는다. set_config 를 쓴다.
+  await c.query(`select set_config('application_name', $1, false)`, [name]);
 }
