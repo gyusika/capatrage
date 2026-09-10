@@ -42,9 +42,20 @@ const r = await c.query(
    with pick as (
      -- 날짜마다 그 날짜를 가장 늦게 본 관측 하나. 달력 화면과 같은 규칙이다.
      -- 지나간 날짜만 본다 — 앞으로의 날짜는 아직 덜 차서 실측이 아니다.
+     --
+     -- 그 날 당일에 본 관측(lead 0)은 쓰지 않는다. 당일 달력은 이미 지나간 시각과
+     -- 당일예약 불가를 전부 "예약 불가"로 돌려주고, 그건 팔렸다는 뜻이 아니다.
+     -- 실측이 아니라 시계다 — 09-10 당일 관측 4,925행이 전부 0시부터 막혀 있고
+     -- 평균 14.4시간인데, 같은 날짜를 하루 전에 본 값은 평균 3.77시간이다.
+     -- 4,909행 중 4,795행이 당일에 시간이 늘고, 99.4%가 전날 값의 상위집합이다.
+     -- 공간 74256 은 09-09 를 08-26·09-06·09-07·09-08 에 볼 때 전부 비어 있다가
+     -- 09-09 당일에만 [0..10] 이 찬다. 하룻밤 새 팔린 게 아니다.
+     --
+     -- 나머지 단계(compute_fill, compute_revenue)는 이미 target_date > observed_date
+     -- 로 당일을 빼고 있었다. 여기만 빠져 있었다.
      select distinct on (b.space_id, b.product_id, b.rsv_type_id, b.target_date) b.*
        from booking_day b
-      where b.target_date < $1
+      where b.target_date < $1 and b.observed_date < b.target_date
       order by b.space_id, b.product_id, b.rsv_type_id, b.target_date, b.observed_date desc
    ),
    ex as (
