@@ -112,14 +112,28 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
    ),
    -- 패키지 가격표. 같은 구간을 시간제 합계보다 싸게 파는 창이다.
    -- 1인당 과금 패키지면 기본가가 1인 단가라 최소 인원을 곱해야 하한이 된다.
+   --
+   -- 날짜마다 그 날짜를 마지막으로 본 가격표를 쓴다. observed_date = __SNAP__ 로
+   -- 박아두면 실측(compute_settled)에서 패키지가 단 한 건도 안 걸린다 — 예약 API 는
+   -- 지난 날짜의 패키지를 아예 안 주므로 기준일 관측분의 target_date 는 전부
+   -- 앞으로의 날짜다. 실측이 보는 건 지나간 날짜라 교집합이 공집합이었다.
+   -- 실제로 space_settled 6,837곳의 n_days_pkg 가 전부 0 이었다.
+   --
+   -- 앞으로의 날짜만 보는 compute_revenue 에서는 결과가 같다. 그 날짜들의 가장
+   -- 늦은 관측이 곧 기준일 관측이기 때문이다. 달력(pick)과 같은 규칙이기도 하다.
+   pkg_pick as (
+     select distinct on (p.space_id, p.product_id, p.package_id, p.target_date) p.*
+       from booking_package p
+      where p.observed_date <= __SNAP__ and p.observed_date < p.target_date and p.price > 0
+      order by p.space_id, p.product_id, p.package_id, p.target_date, p.observed_date desc
+   ),
    pkg_all as (
      select p.space_id, p.product_id, p.target_date, p.shour, p.ehour,
             min(case when coalesce(g.per_person, false) then p.price * g.min_guest
                      else p.price end) as pkg_floor
-       from booking_package p
+       from pkg_pick p
        left join guest g on g.space_id = p.space_id and g.product_id = p.product_id
                         and g.rsv_type_id = p.rsv_type_id
-      where p.observed_date = __SNAP__ and p.price > 0
       group by p.space_id, p.product_id, p.target_date, p.shour, p.ehour
    ),
    -- 하루 안에서 끝나는 창.

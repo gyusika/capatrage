@@ -58,6 +58,21 @@ const r = await c.query(
       where b.target_date < $1 and b.observed_date < b.target_date
       order by b.space_id, b.product_id, b.rsv_type_id, b.target_date, b.observed_date desc
    ),
+   -- 영업시간 판정은 상품마다 하나만 쓴다. 시각별 영업 여부는 날마다 바뀌지 않고,
+   -- 과거 관측일마다 따로 잡으면 같은 상품이 날짜별로 다른 영업시간을 갖게 된다.
+   --
+   -- 기준일 관측분으로 못 박으면 안 된다. 그 사이 내려간 상품은 판정이 없어서
+   -- 조인에서 통째로 떨어지고, 그 상품이 지난 날짜에 실제로 판 매출이 사라진다.
+   -- 달력 화면은 그 상품을 그대로 그리므로 화면과 집계가 갈린다 — 공간 883 은
+   -- 상품 21개 중 5개가 내려갔고 실측 4,082시각 중 960시각이 그 5개 것이라,
+   -- 화면 211만원 대 집계 1만원이었다. 실측 창 전체로는 110곳 11,780시각(1.9%)이다.
+   -- 그래서 그 상품을 마지막으로 판정한 관측을 쓴다.
+   hc as (
+     select distinct on (space_id, product_id, rsv_type_id, hour) *
+       from booking_hour_class
+      where observed_date <= $1
+      order by space_id, product_id, rsv_type_id, hour, observed_date desc
+   ),
    ex as (
      select p.space_id, p.product_id, p.rsv_type_id, p.observed_date, p.target_date,
             (p.target_date - p.observed_date) as lead_days,
@@ -67,11 +82,9 @@ const r = await c.query(
             k.is_closed
        from pick p
        cross join generate_series(0, 23) as h(hour)
-       -- 영업시간 판정은 최신 관측분 하나를 쓴다. 시각별 영업 여부는 날마다 바뀌지 않고,
-       -- 과거 관측일마다 따로 잡으면 같은 상품이 날짜별로 다른 영업시간을 갖게 된다.
-       join booking_hour_class k
+       join hc k
          on k.space_id = p.space_id and k.product_id = p.product_id
-        and k.rsv_type_id = p.rsv_type_id and k.observed_date = $1
+        and k.rsv_type_id = p.rsv_type_id
         and k.hour = h.hour
       where not k.is_closed
    ),
