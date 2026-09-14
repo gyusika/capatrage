@@ -76,6 +76,7 @@ const r = await c.query(
    ex as (
      select p.space_id, p.product_id, p.rsv_type_id, p.observed_date, p.target_date,
             (p.target_date - p.observed_date) as lead_days,
+            p.is_holiday,
             h.hour,
             (h.hour = any(p.booked_hours)) as booked,
             coalesce(p.hour_prices[h.hour + 1], p.price) as price,

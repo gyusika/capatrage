@@ -49,6 +49,7 @@ const r = await c.query(
    with ex as (
      select b.space_id, b.product_id, b.rsv_type_id, b.observed_date, b.target_date,
             (b.target_date - b.observed_date) as lead_days,
+            b.is_holiday,
             h.hour,
             (h.hour = any(b.booked_hours)) as booked,
             -- hour_prices 가 없던 예전 수집분은 일 단가로 대체한다
@@ -207,11 +208,11 @@ console.log(
   `\n패키지 가격표 ${Number(pax.rows).toLocaleString('ko-KR')}행 / ${pax.spaces}곳` +
   (pax.wrap ? ` (자정을 넘는 창 ${pax.wrap}행은 다음 날 새벽과 짝지어 맞춘다)` : '') + '\n' +
   (pkx.blocks
-    ? `  예약 덩어리 ${Number(pkx.blocks).toLocaleString('ko-KR')}건이 패키지 창과 정확히 일치해 ` +
+    ? `  예약 덩어리 ${Number(pkx.blocks).toLocaleString('ko-KR')}건이 패키지 창을 품고 있어 ` +
       `${pkx.spaces}곳의 하한을 패키지가로 다시 잡았다\n` +
       `  그만큼 깎인 월환산 매출 ${won(pkx.cut)} · 해당 공간 하한의 중앙값 기준 ` +
       `${pkx.share == null ? '—' : (Number(pkx.share) * 100).toFixed(1) + '%'} 감소`
-    : '  패키지 창과 정확히 일치하는 예약 덩어리가 없어 하한 보정 없음')
+    : '  패키지 창을 품는 예약 덩어리가 없어 하한 보정 없음')
 );
 
 // 매출 구간. 예약 인원을 관측할 수 없어 값 하나로 낼 수 없다.

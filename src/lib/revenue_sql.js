@@ -7,7 +7,7 @@
  *
  * 호출자가 ex 를 정의해서 넘긴다. ex 는 아래 컬럼을 가져야 한다:
  *   space_id, product_id, rsv_type_id, observed_date, target_date, lead_days,
- *   hour, booked, price
+ *   is_holiday, hour, booked, price
  *
  * 호출자는 세 곳에서 집계한다. 갈래를 나눈 이유는 아래 numbered 주석에 있다.
  *   flagged  — 열려 있는 모든 시각 (분모·더미·잠재매출)
@@ -106,7 +106,8 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
             min(hour) as h0, max(hour) as h1,
             sum(floor_amt) as blk_floor,
             -- block_add 는 상품·예약타입마다 하나로 정해진 값이라 덩어리 안에서 일정하다
-            max(block_add) as block_add
+            max(block_add) as block_add,
+            bool_or(coalesce(is_holiday, false)) as is_holiday
        from numbered
       group by space_id, product_id, rsv_type_id, observed_date, target_date, lead_days, blk
    ),
@@ -127,7 +128,7 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
       where p.observed_date <= __SNAP__ and p.observed_date < p.target_date and p.price > 0
       order by p.space_id, p.product_id, p.package_id, p.target_date, p.observed_date desc
    ),
-   pkg_all as (
+   pkg_seen as (
      select p.space_id, p.product_id, p.target_date, p.shour, p.ehour,
             min(case when coalesce(g.per_person, false) then p.price * g.min_guest
                      else p.price end) as pkg_floor
@@ -135,6 +136,64 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
        left join guest g on g.space_id = p.space_id and g.product_id = p.product_id
                         and g.rsv_type_id = p.rsv_type_id
       group by p.space_id, p.product_id, p.target_date, p.shour, p.ehour
+   ),
+   -- 그 날짜의 패키지 관측이 없으면 같은 상품의 가격표로 대신한다.
+   --
+   -- 패키지 수집은 09-07 에 시작했고 예약 API 는 지난 날짜의 패키지를 안 준다.
+   -- 그래서 그 전 날짜는 패키지 행이 한 줄도 없고, 실측 창의 2/3 가 시간제 합계로만
+   -- 세어졌다 — 패키지를 파는 상품의 실측 예약 172,237시각 중 120,673시각(70%),
+   -- 1,600곳이 이 상태였다. 공간 36359 는 08-28 19시~08-29 9시가 나이트타임
+   -- 280,000원 창과 정확히 맞는데도 560,000원으로 잡혔다.
+   --
+   -- 패키지 창(시작·끝 시각)은 상품의 속성이지 날짜의 속성이 아니다. 가격만 요일·
+   -- 공휴일에 따라 달라서(데이타임 160,000 / 주말 200,000), 같은 성격의 날에 관측된
+   -- 값을 쓰고, 그런 날이 없으면 어느 날이든 가장 싼 값을 쓴다. 어느 쪽이든 하한이다.
+   cal as (
+     select target_date, bool_or(coalesce(is_holiday, false)) as is_holiday
+       from booking_day where observed_date = __SNAP__ group by target_date
+   ),
+   pkg_cat as (
+     select p.space_id, p.product_id, p.shour, p.ehour,
+            case when coalesce(c.is_holiday, false) then 7
+                 else extract(dow from p.target_date)::int end as dclass,
+            min(case when coalesce(g.per_person, false) then p.price * g.min_guest
+                     else p.price end) as pkg_floor
+       from pkg_pick p
+       left join guest g on g.space_id = p.space_id and g.product_id = p.product_id
+                        and g.rsv_type_id = p.rsv_type_id
+       left join cal c on c.target_date = p.target_date
+      group by 1, 2, 3, 4, 5
+   ),
+   pkg_cat_any as (
+     select space_id, product_id, shour, ehour, min(pkg_floor) as pkg_floor
+       from pkg_cat group by 1, 2, 3, 4
+   ),
+   -- 예약 덩어리가 있는데 그 날짜의 패키지 관측은 없는 (상품, 날짜).
+   pkg_need as (
+     select distinct a.space_id, a.product_id, a.target_date,
+            case when a.is_holiday then 7
+                 else extract(dow from a.target_date)::int end as dclass
+       from blk_agg a
+      where not exists (select 1 from pkg_seen k
+                         where k.space_id = a.space_id and k.product_id = a.product_id
+                           and k.target_date = a.target_date)
+   ),
+   pkg_fill as (
+     select n.space_id, n.product_id, n.target_date, c.shour, c.ehour, c.pkg_floor
+       from pkg_need n
+       join pkg_cat c on c.space_id = n.space_id and c.product_id = n.product_id
+                     and c.dclass = n.dclass
+     union all
+     select n.space_id, n.product_id, n.target_date, c.shour, c.ehour, c.pkg_floor
+       from pkg_need n
+       join pkg_cat_any c on c.space_id = n.space_id and c.product_id = n.product_id
+      where not exists (select 1 from pkg_cat c2
+                         where c2.space_id = c.space_id and c2.product_id = c.product_id
+                           and c2.shour = c.shour and c2.ehour = c.ehour
+                           and c2.dclass = n.dclass)
+   ),
+   pkg_all as (
+     select * from pkg_seen union all select * from pkg_fill
    ),
    -- 하루 안에서 끝나는 창.
    pkg as (
@@ -152,33 +211,89 @@ const TEMPLATE = `   -- 그 상품의 통상 단가. 더미 판정의 기준선�
    pkg_over as (
      select * from pkg_all where shour >= ehour and ehour > 0
    ),
-   -- 예약 덩어리가 패키지 창과 정확히 일치하면 그 덩어리는 패키지로 팔렸을 수 있다.
+   -- 패키지 창이 예약 덩어리 안에 통째로 들어가면 그 창의 시간만 패키지가로 잡는다.
    -- 어느 쪽으로 팔렸는지는 관측되지 않으므로 하한에는 싼 값(패키지가)을 쓴다.
    -- 상한(ceil_amt 합계)은 시간제로 팔린 경우라 그대로 둔다.
-   -- 일치하지 않는 덩어리는 패키지로 살 수 없는 구간이라 손대지 않는다.
-   pkg_adj as (
-     select a.space_id, a.observed_date, a.lead_days,
-            a.blk_floor - k.pkg_floor as cut
+   --
+   -- 예전엔 덩어리와 창이 정확히 일치할 때만 봤다. 그러면 패키지 뒤에 한 시간만
+   -- 붙어도 통째로 시간제가 된다 — 공간 36359 의 08-29 는 11~17시 데이타임 창에
+   -- 17시 한 시간이 더 붙어 [11..17] 인데, 그 7시간이 350,000원으로 세어졌다.
+   -- 서로 다른 사람의 인접 예약은 관측에서 한 덩어리로 합쳐지므로(numbered 주석)
+   -- "패키지 + 옆 시간제 예약"은 덩어리 하나로 보인다. 창 밖 시간은 시간제 그대로다.
+   --
+   -- 덩어리 하나에 창이 여럿 맞으면 가장 많이 깎이는 하나만 쓴다. 겹치는 창을
+   -- 둘 다 깎으면 하한이 실제보다 내려가므로, 하나만 고르는 쪽이 안전하다.
+   -- 자정을 넘는 창을 먼저 고르고, 그 창이 차지한 시간과 겹치는 하루 안 창은 뺀다.
+   --
+   -- 창 안 시간의 시간제 합계는 numbered 에서 다시 더한다. 창이 덩어리 일부일 수
+   -- 있어 blk_floor 를 그대로 못 쓴다.
+   pkg_hit as (
+     select a.space_id, a.product_id, a.rsv_type_id, a.observed_date, a.target_date,
+            a.lead_days, a.blk, k.shour, k.ehour, k.pkg_floor,
+            sum(n.floor_amt) as win_floor
        from blk_agg a
        join pkg k on k.space_id = a.space_id and k.product_id = a.product_id
                  and k.target_date = a.target_date
-                 and k.shour = a.h0 and k.ehour = a.h1 + 1
-      where k.pkg_floor < a.blk_floor
-     union all
-     -- 자정을 넘는 창: 그 날 끝 덩어리와 다음 날 첫 덩어리를 짝지어 하나로 본다.
-     -- 깎인 금액은 창이 시작한 날짜에 붙인다. 그 날 팔린 예약이기 때문이다.
-     select a.space_id, a.observed_date, a.lead_days,
-            a.blk_floor + b.blk_floor - k.pkg_floor as cut
+                 and k.shour >= a.h0 and k.ehour - 1 <= a.h1
+       join numbered n on n.space_id = a.space_id and n.product_id = a.product_id
+                      and n.rsv_type_id = a.rsv_type_id and n.observed_date = a.observed_date
+                      and n.target_date = a.target_date and n.blk = a.blk
+                      and n.hour between k.shour and k.ehour - 1
+      group by a.space_id, a.product_id, a.rsv_type_id, a.observed_date, a.target_date,
+               a.lead_days, a.blk, k.shour, k.ehour, k.pkg_floor
+   ),
+   -- 자정을 넘는 창: 그 날 [shour..23] 이 끝 덩어리 안에, 다음 날 [0..ehour-1] 이
+   -- 첫 덩어리 안에 들어가면 하나로 본다. 깎인 금액은 창이 시작한 날짜에 붙인다.
+   pkg_hit_over as (
+     select a.space_id, a.product_id, a.rsv_type_id, a.observed_date, a.target_date,
+            a.lead_days, a.blk, b.blk as blk_next, k.shour, k.ehour, k.pkg_floor,
+            sum(n.floor_amt) as win_floor
        from blk_agg a
        join pkg_over k on k.space_id = a.space_id and k.product_id = a.product_id
                       and k.target_date = a.target_date
-                      and k.shour = a.h0 and a.h1 = 23
+                      and k.shour >= a.h0 and a.h1 = 23
        join blk_agg b on b.space_id = a.space_id and b.product_id = a.product_id
                      and b.rsv_type_id = a.rsv_type_id
                      and b.observed_date = a.observed_date
                      and b.target_date = a.target_date + 1
-                     and b.h0 = 0 and b.h1 = k.ehour - 1
-      where k.pkg_floor < a.blk_floor + b.blk_floor
+                     and b.h0 = 0 and b.h1 >= k.ehour - 1
+       join numbered n on n.space_id = a.space_id and n.product_id = a.product_id
+                      and n.rsv_type_id = a.rsv_type_id and n.observed_date = a.observed_date
+                      and ((n.target_date = a.target_date and n.blk = a.blk and n.hour >= k.shour)
+                        or (n.target_date = b.target_date and n.blk = b.blk and n.hour < k.ehour))
+      group by a.space_id, a.product_id, a.rsv_type_id, a.observed_date, a.target_date,
+               a.lead_days, a.blk, b.blk, k.shour, k.ehour, k.pkg_floor
+   ),
+   pkg_pick_over as (
+     select distinct on (space_id, product_id, rsv_type_id, observed_date, target_date, blk) *
+       from pkg_hit_over
+      where win_floor > pkg_floor
+      order by space_id, product_id, rsv_type_id, observed_date, target_date, blk,
+               win_floor - pkg_floor desc
+   ),
+   pkg_pick_day as (
+     select distinct on (h.space_id, h.product_id, h.rsv_type_id, h.observed_date, h.target_date, h.blk) h.*
+       from pkg_hit h
+      where h.win_floor > h.pkg_floor
+        -- 같은 덩어리가 자정 창의 앞쪽이면 그 창이 시작한 시각부터는 이미 팔린 시간이다
+        and not exists (select 1 from pkg_pick_over o
+                         where o.space_id = h.space_id and o.product_id = h.product_id
+                           and o.rsv_type_id = h.rsv_type_id and o.observed_date = h.observed_date
+                           and o.target_date = h.target_date and o.blk = h.blk
+                           and h.ehour - 1 >= o.shour)
+        -- 자정 창의 뒤쪽이면 그 창이 끝나는 시각까지가 이미 팔린 시간이다
+        and not exists (select 1 from pkg_pick_over o
+                         where o.space_id = h.space_id and o.product_id = h.product_id
+                           and o.rsv_type_id = h.rsv_type_id and o.observed_date = h.observed_date
+                           and o.target_date + 1 = h.target_date and o.blk_next = h.blk
+                           and h.shour < o.ehour)
+      order by h.space_id, h.product_id, h.rsv_type_id, h.observed_date, h.target_date, h.blk,
+               h.win_floor - h.pkg_floor desc
+   ),
+   pkg_adj as (
+     select space_id, observed_date, lead_days, win_floor - pkg_floor as cut from pkg_pick_over
+     union all
+     select space_id, observed_date, lead_days, win_floor - pkg_floor as cut from pkg_pick_day
    ),`;
 
 /**
