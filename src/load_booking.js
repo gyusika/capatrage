@@ -115,6 +115,12 @@ if (pkgRows.length) {
   console.log('booking_package: 0건 (이번 수집분에 패키지가 없다)');
 }
 
+// 오늘 넣은 observed_date 는 플래너 통계에 아직 없는 값이다. 통계가 그대로면 뒤따르는
+// compute_fill 이 그 날짜를 0행으로 보고 nested loop 를 골라, 5초짜리 차단 판별이
+// 2시간 3분이 됐다(09-15). 자동 analyze 는 표의 10%가 바뀌어야 도는데 하루치 25만 행은
+// 550만 행의 10%에 못 미쳐 영영 안 돈다. 몇 초면 끝나므로 적재 끝에 직접 돌린다.
+await client.query(`analyze booking_day, booking_package`);
+
 const s = await client.query(
   `select count(distinct space_id) spaces, count(*) rows,
           min(target_date) from_d, max(target_date) to_d,
