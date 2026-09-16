@@ -17,6 +17,10 @@ on:
       run_date:
         description: '관측일 (YYYY-MM-DD). 비우면 실행 시점의 KST 날짜'
         required: false
+  # rerun/YYYY-MM-DD 브랜치를 푸시하면 그 날짜로 다시 돈다. 점검 routine(클라우드 에이전트)이
+  # 고친 뒤 재실행을 걸 때 쓴다 — 거기선 gh 인증이 없을 수 있어서 git push 만으로 되게 했다.
+  push:
+    branches: ['rerun/**']
 
 # 이전 실행이 아직 돌고 있으면 겹치지 않게 한다. 상대 서버에 대한 요청률이
 # 두 배가 되는 것을 막는 안전장치다.
@@ -41,6 +45,7 @@ jobs:
         id: d
         run: |
           D="${{ inputs.run_date }}"
+          case "$GITHUB_REF" in refs/heads/rerun/*) D="${GITHUB_REF#refs/heads/rerun/}";; esac
           [ -n "$D" ] || D=$(TZ=Asia/Seoul date +%F)
           echo "date=$D" >> "$GITHUB_OUTPUT"
           echo "관측일 $D"
@@ -81,6 +86,8 @@ jobs:
         run: |
           for i in 1 2 3; do
             npm run crawl && exit 0
+            # exit 2 = 형식이 바뀌어 한 건도 못 읽는다. 다시 두드려도 같으니 바로 실패.
+            [ $? -eq 2 ] && exit 2
             echo "크롤 ${i}차 실패. 남은 것만 이어서 다시 받는다."
             sleep 60
           done
@@ -157,6 +164,7 @@ jobs:
         run: |
           for i in 1 2 3; do
             npm run booking && exit 0
+            [ $? -eq 2 ] && exit 2
             echo "예약 수집 ${i}차 실패. done.txt 뒤부터 다시 받는다."
             sleep 60
           done

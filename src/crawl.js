@@ -101,6 +101,15 @@ async function worker() {
     }
 
     const n = ok + gone + failed;
+    // 처음 200건이 한 건도 못 읽히면 페이지 형식이 바뀐 것이다. 09-16 에 상세 페이지가
+    // Nuxt 에서 Next.js 로 바뀌어 14,074건이 전부 실패했는데, 잡은 "성공"으로 끝났고
+    // 뒤 단계가 0곳으로 돌았다. 여기서 바로 죽어야 실패로 보이고 4시간을 안 날린다.
+    if (n === 200 && ok === 0 && failed >= 150) {
+      const msg = `처음 ${n}건 중 ${failed}건 실패, 정상 수신 0건 — 페이지 형식이 바뀐 것 같다. 중단`;
+      console.error(msg);
+      await P.fail(msg);
+      process.exit(2);
+    }
     if (n % 250 === 0) {
       const el = (Date.now() - started) / 1000;
       const rate = n / el;

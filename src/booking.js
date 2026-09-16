@@ -213,6 +213,13 @@ async function worker() {
       fs.appendFileSync(path.join(outDir, 'errors.log'), `${key(u)}\t${e.message}\n`);
     }
     const n = ok + fail;
+    // 처음 200건이 한 건도 안 되면 API 가 바뀐 것이다. 이어서 3시간 두드릴 이유가 없다.
+    if (n === 200 && ok === 0) {
+      const msg = `처음 ${n}건 중 ${fail}건 실패, 정상 수신 0건 — 예약 API 가 바뀐 것 같다. 중단`;
+      console.error(msg);
+      await P.fail(msg);
+      process.exit(2);
+    }
     if (n % 200 === 0) {
       const el = (Date.now() - started) / 1000;
       console.log(
