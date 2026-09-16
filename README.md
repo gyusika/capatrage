@@ -78,7 +78,14 @@ Vercel Function 도 Supabase Edge Function 도 실행시간 한도가 800초라 
 | `www.spacecloud.kr/space/{id}` | 허용 | 상세 (가격·평수·정원·좌표·휴무) |
 | `www.spacecloud.kr/search*` | **Disallow** | 쓰지 않음. 열거는 sitemap 으로만 |
 
-상세 페이지가 Nuxt SSR 이라 `window.__NUXT__` 안에 API 응답이 통째로 들어있다.
+상세 페이지는 SSR 이라 API 응답(detail)이 HTML 안에 통째로 들어있다. 2026-09-15 까지는
+Nuxt 라 `window.__NUXT__` 안에 있었고, 09-16 부터 Next.js 로 바뀌어 RSC 페이로드
+(`self.__next_f.push`) 안에 `"detail":{...}` 로 들어간다. 그 날 크롤 14,074건이 전부
+'nuxt payload 없음'으로 실패했다. `src/lib/nuxt.js` 가 두 형식을 다 읽고, 바뀐 표기
+(`rsv_tp_cd` 소문자, `charging_per_person` 불리언)는 예전 모양(`RSV_TP_CD`, 'Y'/'N')으로
+되돌려서 적재 코드와 DB 는 그대로다. 파서만 고치면 되는 건 `www.spacecloud.kr/space/{id}` 가
+여전히 robots 허용이고 같은 데이터를 주기 때문이다 — `api.spacecloud.kr/spaces/{id}` 도
+같은 JSON 을 주지만 그 호스트는 disallow 라 쓰지 않았다.
 
 ### 예약 현황 — `api.spacecloud.kr` (robots 미준수, 사용자 승인)
 
